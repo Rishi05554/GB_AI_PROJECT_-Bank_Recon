@@ -26,6 +26,20 @@ PROCEDURE log_step (
     p_detail            IN VARCHAR2  DEFAULT NULL
 );
 
+PROCEDURE xxemr_fetch_candidate (
+    p_source IN  VARCHAR2,
+    p_id     IN  NUMBER,
+    p_amount OUT NUMBER,
+    p_date   OUT DATE
+);
+
+PROCEDURE xxemr_insert_fbdi_lines (
+    p_statement_line_id IN NUMBER,
+    p_candidates        IN VARCHAR2,
+    p_recon_method      IN VARCHAR2,
+    p_match_group_id    IN NUMBER   DEFAULT NULL,
+    p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
+);
 
 
 -- ================================================================
@@ -154,6 +168,154 @@ BEGIN
     END IF;
 
 END xxemr_fetch_candidate;
+
+
+-- ----------------------------------------------------------------
+-- PRIVATE: xxemr_insert_fbdi_lines
+-- Purpose : Inserts one row per reconciliation participant into
+--           XXEMR_RECON_FBDI_LINES, which is the source of truth
+--           for OIC FBDI loading.
+--
+--           Always inserts:
+--             1 BS  row  → the bank statement line itself
+--             N AR/XT rows → one per candidate token
+--
+--           Source codes:
+--             AR prefix → source_code = 'AR'
+--             EX prefix → source_code = 'XT'
+--
+--           All rows in a group share the same recon_reference
+--           generated here (GroupAI001, GroupAI002 ...).
+--           send_status defaults to 'PENDING' — OIC polls for these.
+-- ----------------------------------------------------------------
+PROCEDURE xxemr_insert_fbdi_lines (
+    p_statement_line_id IN NUMBER,
+    p_candidates        IN VARCHAR2,
+    p_recon_method      IN VARCHAR2,
+    p_match_group_id    IN NUMBER   DEFAULT NULL,
+    p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
+)
+IS
+    l_recon_reference   VARCHAR2(50);
+    l_bank_account_id   VARCHAR2(100);
+    l_seq_val           NUMBER;
+    l_remaining         VARCHAR2(4000);
+    l_pos               NUMBER;
+    l_token             VARCHAR2(200);
+    l_source            VARCHAR2(10);
+    l_candidate_id      NUMBER;
+BEGIN
+    -- Step 1: Fetch bank_account_id for the statement line
+    BEGIN
+        SELECT bank_account_id
+          INTO l_bank_account_id
+          FROM xxemr_bank_statement_lines
+         WHERE statement_line_id = p_statement_line_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20410,
+                'xxemr_insert_fbdi_lines: Statement line not found: '
+                || p_statement_line_id);
+    END;
+
+    -- Step 2: Generate group reference — GroupAI001, GroupAI002 ...
+    SELECT xxemr_recon_group_ref_seq.NEXTVAL INTO l_seq_val FROM DUAL;
+    l_recon_reference := 'GroupAI' || LPAD(TO_CHAR(l_seq_val), 3, '0');
+
+    -- Step 3: Insert BS row for the bank statement line
+    INSERT INTO xxemr_recon_fbdi_lines (
+        fbdi_line_id,
+        recon_reference,
+        bank_account_id,
+        source_code,
+        source_id,
+        match_group_id,
+        statement_line_id,
+        recon_method,
+        send_status,
+        send_attempts,
+        created_by,
+        creation_date,
+        last_updated_by,
+        last_update_date
+    ) VALUES (
+        xxemr_recon_fbdi_seq.NEXTVAL,
+        l_recon_reference,
+        l_bank_account_id,
+        'BS',
+        p_statement_line_id,
+        p_match_group_id,
+        p_statement_line_id,
+        p_recon_method,
+        'PENDING',
+        0,
+        p_user,
+        SYSTIMESTAMP,
+        p_user,
+        SYSTIMESTAMP
+    );
+
+    -- Step 4: Insert one row per candidate (AR or XT)
+    l_remaining := p_candidates || ':';
+    LOOP
+        l_pos := INSTR(l_remaining, ':');
+        EXIT WHEN l_pos = 0;
+        l_token     := TRIM(SUBSTR(l_remaining, 1, l_pos - 1));
+        l_remaining := SUBSTR(l_remaining, l_pos + 1);
+        EXIT WHEN l_token IS NULL;
+
+        xxemr_parse_token(l_token, l_source, l_candidate_id);
+
+        INSERT INTO xxemr_recon_fbdi_lines (
+            fbdi_line_id,
+            recon_reference,
+            bank_account_id,
+            source_code,
+            source_id,
+            match_group_id,
+            statement_line_id,
+            recon_method,
+            send_status,
+            send_attempts,
+            created_by,
+            creation_date,
+            last_updated_by,
+            last_update_date
+        ) VALUES (
+            xxemr_recon_fbdi_seq.NEXTVAL,
+            l_recon_reference,
+            l_bank_account_id,
+            CASE l_source
+                WHEN 'AR' THEN 'AR'
+                WHEN 'EX' THEN 'XT'
+                ELSE l_source
+            END,
+            l_candidate_id,
+            p_match_group_id,
+            p_statement_line_id,
+            p_recon_method,
+            'PENDING',
+            0,
+            p_user,
+            SYSTIMESTAMP,
+            p_user,
+            SYSTIMESTAMP
+        );
+    END LOOP;
+
+    log_step(NULL, p_statement_line_id,
+        'FBDI_LINES_INSERTED', 'SUCCESS',
+        'Ref: ' || l_recon_reference
+        || ' | Method: ' || p_recon_method
+        || ' | Candidates: ' || p_candidates);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        log_step(NULL, p_statement_line_id,
+            'FBDI_LINES_INSERT', 'FAILED',
+            SUBSTR(DBMS_UTILITY.FORMAT_ERROR_STACK, 1, 2000));
+        RAISE;
+END xxemr_insert_fbdi_lines;
 
 
 -- ================================================================
@@ -402,7 +564,18 @@ BEGIN
 
     IF l_amt_diff = 0 THEN
 
-        -- Step 5: Create match group header + details
+        -- Step 5: Insert FBDI staging rows (source of truth for OIC loading).
+        --         Done before match group insert and status updates so that
+        --         if FBDI insert fails the whole transaction rolls back cleanly.
+        xxemr_insert_fbdi_lines(
+            p_statement_line_id => p_statement_line_id,
+            p_candidates        => p_candidates,
+            p_recon_method      => 'MANUAL',
+            p_match_group_id    => NULL,   -- match group not yet created at this point
+            p_user              => p_user
+        );
+
+        -- Step 6: Create match group header + details
         xxemr_insert_match_group(
             p_statement_line_id => p_statement_line_id,
             p_candidates        => p_candidates,
@@ -414,7 +587,7 @@ BEGIN
             p_user              => p_user
         );
 
-        -- Step 6: Stamp MANUAL_RECON status on all records
+        -- Step 7: Stamp MANUAL_RECON status on all records
         xxemr_update_recon_status(
             p_statement_line_id => p_statement_line_id,
             p_candidates        => p_candidates,
@@ -467,23 +640,37 @@ BEGIN
       FROM xxemr_match_groups
      WHERE match_group_id = p_match_group_id;
 
-    -- Step 2: Build candidate token list from details
+    -- Step 2: Build candidate token list from match group details
     SELECT LISTAGG(candidate_source || candidate_id, ':')
            WITHIN GROUP (ORDER BY candidate_id)
       INTO l_candidates
       FROM xxemr_match_group_details
      WHERE match_group_id = p_match_group_id;
-     IF p_match_group_id IS NOT NULL THEN
-         
- UPDATE XXEMR_MATCH_GROUPS
- SET USER_ACTION='REJECTED'
- WHERE STATEMENT_LINE_ID=l_statement_line_id;
 
- UPDATE XXEMR_MATCH_GROUPS
- SET USER_ACTION='ACCEPTED'
- WHERE MATCH_GROUP_ID=p_match_group_id;
-END IF;
-    -- Step 3: Apply reconciliation status
+    -- Step 3: Insert FBDI staging rows (source of truth for OIC loading).
+    --         Done before any status updates so that if FBDI insert fails
+    --         the whole transaction rolls back cleanly.
+    IF p_match_group_id IS NOT NULL THEN
+    
+        UPDATE XXEMR_MATCH_GROUPS
+        SET USER_ACTION='REJECTED'
+        WHERE STATEMENT_LINE_ID=l_statement_line_id;
+
+        UPDATE XXEMR_MATCH_GROUPS
+        SET USER_ACTION='ACCEPTED'
+        WHERE MATCH_GROUP_ID=p_match_group_id;
+
+    END IF;
+
+    xxemr_insert_fbdi_lines(
+        p_statement_line_id => l_statement_line_id,
+        p_candidates        => l_candidates,
+        p_recon_method      => 'AI',
+        p_match_group_id    => p_match_group_id,
+        p_user              => p_user
+    );
+
+    -- -- Step 4: Apply reconciliation status
     -- xxemr_update_recon_status(
     --     p_statement_line_id => l_statement_line_id,
     --     p_candidates        => l_candidates,
@@ -491,20 +678,8 @@ END IF;
     --     p_match_flag        => 'Y',
     --     p_user              => p_user
     -- );
-    DELETE FROM xxemr_match_group_details
-     WHERE match_group_id IN (
-               SELECT match_group_id FROM xxemr_match_groups
-                WHERE statement_line_id = l_statement_line_id
-                  AND match_type IN ('EXT_PENDING','EXT_PARTIAL','EXT_CREATED')
-                  AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN'
-           );
 
-    DELETE FROM xxemr_match_groups
-     WHERE statement_line_id = l_statement_line_id
-       AND match_type IN ('EXT_PENDING','EXT_PARTIAL','EXT_CREATED')
-       AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN';
-    
-	COMMIT;
+    COMMIT;
 
 EXCEPTION
     WHEN NO_DATA_FOUND THEN
@@ -567,7 +742,7 @@ BEGIN
     apex_web_service.g_request_headers.DELETE;
     apex_web_service.g_request_headers(1).name  := 'Content-Type';
     apex_web_service.g_request_headers(1).value := 'application/json';
-    LOG_STEP(NULL, NULL, 'FUSION_PAYLOAD', 'DEBUG', v_payload);
+
     x_api_response := apex_web_service.make_rest_request(
         p_url         => v_endpoint,
         p_http_method => 'POST',
@@ -1523,18 +1698,13 @@ IS
     v_creation_amount   NUMBER         := NULL;
 BEGIN
     BEGIN
-SELECT s.*
-INTO v_stmt
-FROM xxemr_bank_statement_lines s
-WHERE s.statement_line_id = p_statement_line_id
-AND NVL(s.ext_tx_created_flag,'N') <> 'Y'
-AND EXISTS (
-        SELECT 1
-        FROM xxemr_match_groups g
-        WHERE g.statement_line_id = s.statement_line_id
-        AND g.match_type IN ('EXT_PENDING','EXT_PARTIAL')
-)
-FOR UPDATE NOWAIT;
+        SELECT * INTO v_stmt
+          FROM XXEMR_BANK_STATEMENT_LINES
+         WHERE statement_line_id    = p_statement_line_id
+           AND approval_status      = 'PENDING'
+           AND is_profit_withdrawal = 'Y'
+           AND pw_action            = 'PENDING_APPROVAL'
+        FOR UPDATE NOWAIT;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN
             RAISE_APPLICATION_ERROR(-20201,
@@ -1565,10 +1735,10 @@ FOR UPDATE NOWAIT;
      WHERE statement_line_id = p_statement_line_id;
     COMMIT;
 
-    /*DECLARE
+    DECLARE
         v_escrow_flag VARCHAR2(10);
     BEGIN
-        SELECT NVL(h.escrow_account,'Y')
+        SELECT NVL(h.escrow_account,'N')
           INTO v_escrow_flag
           FROM XXEMR_BANK_STATEMENT_HEADERS h
          WHERE h.statement_header_id = v_stmt.statement_header_id;
@@ -1594,9 +1764,8 @@ FOR UPDATE NOWAIT;
         END IF;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN v_txn_type := v_stmt.trx_type;
-    END; */ -- have to review the logic once again.
+    END;
 
-     v_txn_type := v_stmt.trx_type;
     v_creation_amount :=
         CASE UPPER(v_stmt.flow_indicator)
             WHEN 'DBIT' THEN -1 * ABS(v_stmt.amount)
@@ -1625,13 +1794,12 @@ FOR UPDATE NOWAIT;
                ai_created_flag    = 'Y',
                dashboard_flag     = 'N',
                dashboard_message  = NULL,
-               last_updated       = SYSTIMESTAMP,
-               recon_status = 'REC'
+               last_updated       = SYSTIMESTAMP
          WHERE statement_line_id = p_statement_line_id;
 
         UPDATE xxemr_match_groups
            SET match_type       = 'EXT_CREATED',
-               user_action = 'ACTION_TAKEN',
+               user_action      = NVL(V('APP_USER'), 'SYSTEM'),
                last_update_date = SYSTIMESTAMP,
                last_updated_by  = NVL(V('APP_USER'), 'SYSTEM')
          WHERE statement_line_id = p_statement_line_id
@@ -1695,18 +1863,14 @@ IS
     v_creation_amount   NUMBER         := NULL;
 BEGIN
     BEGIN
-SELECT s.*
-INTO v_stmt
-FROM xxemr_bank_statement_lines s
-WHERE s.statement_line_id = p_statement_line_id
-AND NVL(s.ext_tx_created_flag,'N') <> 'Y'
-AND EXISTS (
-        SELECT 1
-        FROM xxemr_match_groups g
-        WHERE g.statement_line_id = s.statement_line_id
-        AND g.match_type IN ('EXT_PENDING','EXT_PARTIAL')
-)
-FOR UPDATE NOWAIT;
+        SELECT * INTO v_stmt
+          FROM XXEMR_BANK_STATEMENT_LINES
+         WHERE statement_line_id    = p_statement_line_id
+           AND approval_status      = 'PENDING'
+           AND external_flag        = 'Y'
+           AND month_end_check_done = 'Y'
+           AND month_end_action     = 'PENDING_APPROVAL'
+        FOR UPDATE NOWAIT;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN
             RAISE_APPLICATION_ERROR(-20301,
@@ -1737,10 +1901,10 @@ FOR UPDATE NOWAIT;
      WHERE statement_line_id = p_statement_line_id;
     COMMIT;
 
-   /* DECLARE
+    DECLARE
         v_escrow_flag VARCHAR2(10);
     BEGIN
-        SELECT NVL(h.escrow_account,'Y')
+        SELECT NVL(h.escrow_account,'N')
           INTO v_escrow_flag
           FROM XXEMR_BANK_STATEMENT_HEADERS h
          WHERE h.statement_header_id = v_stmt.statement_header_id;
@@ -1766,10 +1930,8 @@ FOR UPDATE NOWAIT;
         END IF;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN v_txn_type := v_stmt.trx_type;
-    END;*/ --will have to review the logic
+    END;
 
-    v_txn_type := v_stmt.trx_type;
-  
     v_creation_amount :=
         CASE UPPER(v_stmt.flow_indicator)
             WHEN 'DBIT' THEN -1 * ABS(v_stmt.amount)
@@ -1798,30 +1960,16 @@ FOR UPDATE NOWAIT;
                ai_created_flag    = 'Y',
                dashboard_flag     = 'N',
                dashboard_message  = NULL,
-               last_updated       = SYSTIMESTAMP,
-               recon_status = 'REC'
+               last_updated       = SYSTIMESTAMP
          WHERE statement_line_id = p_statement_line_id;
 
         UPDATE xxemr_match_groups
            SET match_type       = 'EXT_CREATED',
-               user_action = 'ACTION_TAKEN',
+               user_action      = NVL(V('APP_USER'), 'SYSTEM'),
                last_update_date = SYSTIMESTAMP,
                last_updated_by  = NVL(V('APP_USER'), 'SYSTEM')
          WHERE statement_line_id = p_statement_line_id
            AND match_type        IN ('EXT_PENDING', 'EXT_PARTIAL');
-		   
-		   DELETE FROM xxemr_match_group_details
-           WHERE match_group_id IN (
-           SELECT match_group_id FROM xxemr_match_groups
-            WHERE statement_line_id = p_statement_line_id
-              AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
-              AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN'
-       );
-
-         DELETE FROM xxemr_match_groups
-         WHERE statement_line_id = p_statement_line_id
-         AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
-         AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN';
 
         COMMIT;
         log_step(NULL, p_statement_line_id, 'ME_CREATE', 'SUCCESS',
@@ -2200,21 +2348,6 @@ END xxemr_run_one_to_one_batch;
 -- ================================================================
 -- SECTION 7 — ONE-TO-MANY AI MATCHING ENGINE
 -- ================================================================
--- ============================================================
--- ONE-TO-MANY MATCHING PROCEDURES
--- Updated: NEVER_PROCESSED logic ported from one-to-one batch
---          (xxemr_recon_pkg.run_one_to_one_match_batch)
---
--- Change Summary:
---   xxemr_run_batch  : Added l_candidates_found BOOLEAN + NEVER_PROCESSED
---                      fallback INSERT when no candidates are returned for
---                      a statement line.
---   xxemr_run_auto   : Same addition — l_candidates_found + NEVER_PROCESSED
---                      fallback INSERT.
---   Logic mirrors one-to-one: ranking=0, match_score=0, user_action=
---   'NEVER_PROCESSED', total_match_amount=0, difference_amount=stmt amount.
--- ============================================================
-
 
 PROCEDURE xxemr_suggest_line_matches (
 -- ----------------------------------------------------------------
@@ -2461,10 +2594,7 @@ PROCEDURE xxemr_run_batch (
 --             Deletes PENDING suggestions (preserves ACTION_TAKEN
 --             and MANUAL_RECON), calls xxemr_suggest_line_matches
 --             per unmatched line, persists results.
---             UPDATE: Lines with zero candidates are now stamped
---             with ranking=0, match_score=0, user_action=
---             'NEVER_PROCESSED' for manual attention (ported from
---             xxemr_recon_pkg.run_one_to_one_match_batch).
+-- Source    : Ported from standalone xxemr_bank_recon_pkg (Doc 4).
 -- ----------------------------------------------------------------
     p_run_id               IN  NUMBER,
     p_bank_account_id      IN  NUMBER,
@@ -2492,31 +2622,29 @@ PROCEDURE xxemr_run_batch (
                     WHERE mg.statement_line_id = s.statement_line_id
                );
 
-    l_rc               SYS_REFCURSOR;
-    l_rank             NUMBER;
-    l_source           VARCHAR2(30);
-    l_key              VARCHAR2(4000);
-    l_amt              NUMBER;
-    l_amt_diff         NUMBER;
-    l_date_diff        NUMBER;
-    l_ref_score        NUMBER;
-    l_final_score      NUMBER;
-    l_expl             VARCHAR2(4000);
-    l_combo_size       NUMBER;
-    l_count            NUMBER := 0;
-    l_match_group_id   NUMBER;
-    l_match_type       VARCHAR2(30);
-    l_token            VARCHAR2(200);
-    l_pos              NUMBER;
-    l_remaining        VARCHAR2(4000);
-    l_err_msg          VARCHAR2(1000);
-    l_indiv_amount     NUMBER;
-    l_indiv_date       DATE;
-    l_indiv_source     VARCHAR2(10);
-    l_indiv_id         NUMBER;
-    l_stmt_amount      NUMBER;
-    -- *** NEW: track whether any candidate rows were returned ***
-    l_candidates_found BOOLEAN;
+    l_rc             SYS_REFCURSOR;
+    l_rank           NUMBER;
+    l_source         VARCHAR2(30);
+    l_key            VARCHAR2(4000);
+    l_amt            NUMBER;
+    l_amt_diff       NUMBER;
+    l_date_diff      NUMBER;
+    l_ref_score      NUMBER;
+    l_final_score    NUMBER;
+    l_expl           VARCHAR2(4000);
+    l_combo_size     NUMBER;
+    l_count          NUMBER := 0;
+    l_match_group_id NUMBER;
+    l_match_type     VARCHAR2(30);
+    l_token          VARCHAR2(200);
+    l_pos            NUMBER;
+    l_remaining      VARCHAR2(4000);
+    l_err_msg        VARCHAR2(1000);
+    l_indiv_amount   NUMBER;
+    l_indiv_date     DATE;
+    l_indiv_source   VARCHAR2(10);
+    l_indiv_id       NUMBER;
+    l_stmt_amount    NUMBER;
 BEGIN
     -- Delete PENDING suggestions; preserve ACTION_TAKEN and MANUAL_RECON
     DELETE FROM xxemr_match_group_details
@@ -2548,9 +2676,6 @@ BEGIN
     FOR r IN c_stmt LOOP
 
         BEGIN
-            -- *** NEW: reset flag at the start of each line ***
-            l_candidates_found := FALSE;
-
             xxemr_suggest_line_matches(
                 p_statement_line_id    => r.statement_line_id,
                 p_top_n                => p_top_n,
@@ -2569,9 +2694,6 @@ BEGIN
                 FETCH l_rc INTO l_rank, l_source, l_key, l_amt, l_amt_diff,
                                 l_date_diff, l_ref_score, l_final_score, l_expl, l_combo_size;
                 EXIT WHEN l_rc%NOTFOUND;
-
-                -- *** NEW: at least one row fetched ***
-                l_candidates_found := TRUE;
 
                 l_match_type :=
                     CASE
@@ -2634,10 +2756,12 @@ BEGIN
 
                         INSERT INTO xxemr_match_group_details (
                             match_group_detail_id, match_group_id,
+                            candidate_source,
                             candidate_id, amount, individual_score,
                             amount_diff, max_date_diff_days, reference_score
                         ) VALUES (
                             xxemr_match_grp_dtl_seq.nextval, l_match_group_id,
+                            l_indiv_source,   -- 'AR' or 'EX' — drives FBDI source_code
                             l_indiv_id, l_indiv_amount, l_final_score,
                             ABS(l_stmt_amount - l_indiv_amount), l_date_diff, l_ref_score
                         );
@@ -2647,37 +2771,6 @@ BEGIN
             END LOOP;
 
             CLOSE l_rc;
-
-            -- *** NEW: No candidates returned — stamp NEVER_PROCESSED for
-            --          manual attention, mirroring one-to-one batch behaviour.
-            --          ranking=0 and match_score=0 distinguish these rows from
-            --          genuine suggestions. difference_amount = full stmt amount
-            --          so the reconciler can see the unmatched exposure. ***
-            IF NOT l_candidates_found THEN
-                BEGIN
-                    SELECT NVL(amount, 0) INTO l_stmt_amount
-                      FROM xxemr_bank_statement_lines
-                     WHERE statement_line_id = r.statement_line_id;
-                EXCEPTION
-                    WHEN NO_DATA_FOUND THEN l_stmt_amount := 0;
-                END;
-
-                INSERT INTO xxemr_match_groups (
-                    match_group_id, statement_line_id, total_match_amount,
-                    difference_amount, match_score, match_type, ranking,
-                    user_action, candidate_source, created_date
-                ) VALUES (
-                    xxemr_match_groups_seq.nextval, r.statement_line_id,
-                    0,                  -- total_match_amount: nothing matched
-                    l_stmt_amount,      -- difference_amount:  full unmatched exposure
-                    0,                  -- match_score:        no score
-                    'ONE_TO_MANY',      -- match_type:         preserve batch context
-                    0,                  -- ranking:            sentinel value
-                    'NEVER_PROCESSED',  -- user_action:        flag for manual review
-                    NULL,               -- candidate_source:   unknown
-                    SYSDATE
-                );
-            END IF;
 
         EXCEPTION
             WHEN OTHERS THEN
@@ -2711,10 +2804,7 @@ PROCEDURE xxemr_run_auto (
 --             Processes only lines with NO existing match group
 --             (NOT EXISTS guard). Rolling 3-month window prevents
 --             full table scan. No DELETE performed — incremental.
---             UPDATE: Lines with zero candidates are now stamped
---             with ranking=0, match_score=0, user_action=
---             'NEVER_PROCESSED' for manual attention (ported from
---             xxemr_recon_pkg.run_one_to_one_match_batch).
+-- Source    : Ported from standalone xxemr_bank_recon_pkg (Doc 4).
 -- ----------------------------------------------------------------
     p_run_id               OUT NUMBER,
     p_top_n                IN  NUMBER   DEFAULT 3,
@@ -2739,40 +2829,35 @@ PROCEDURE xxemr_run_auto (
                     WHERE mg.statement_line_id = s.statement_line_id
                );
 
-    l_rc               SYS_REFCURSOR;
-    l_rank             NUMBER;
-    l_source           VARCHAR2(30);
-    l_key              VARCHAR2(4000);
-    l_amt              NUMBER;
-    l_amt_diff         NUMBER;
-    l_date_diff        NUMBER;
-    l_ref_score        NUMBER;
-    l_final_score      NUMBER;
-    l_expl             VARCHAR2(4000);
-    l_combo_size       NUMBER;
-    l_count            NUMBER := 0;
-    l_match_group_id   NUMBER;
-    l_match_type       VARCHAR2(30);
-    l_token            VARCHAR2(200);
-    l_pos              NUMBER;
-    l_remaining        VARCHAR2(4000);
-    l_err_msg          VARCHAR2(1000);
-    l_indiv_amount     NUMBER;
-    l_indiv_date       DATE;
-    l_indiv_source     VARCHAR2(10);
-    l_indiv_id         NUMBER;
-    l_stmt_amount      NUMBER;
-    -- *** NEW: track whether any candidate rows were returned ***
-    l_candidates_found BOOLEAN;
+    l_rc             SYS_REFCURSOR;
+    l_rank           NUMBER;
+    l_source         VARCHAR2(30);
+    l_key            VARCHAR2(4000);
+    l_amt            NUMBER;
+    l_amt_diff       NUMBER;
+    l_date_diff      NUMBER;
+    l_ref_score      NUMBER;
+    l_final_score    NUMBER;
+    l_expl           VARCHAR2(4000);
+    l_combo_size     NUMBER;
+    l_count          NUMBER := 0;
+    l_match_group_id NUMBER;
+    l_match_type     VARCHAR2(30);
+    l_token          VARCHAR2(200);
+    l_pos            NUMBER;
+    l_remaining      VARCHAR2(4000);
+    l_err_msg        VARCHAR2(1000);
+    l_indiv_amount   NUMBER;
+    l_indiv_date     DATE;
+    l_indiv_source   VARCHAR2(10);
+    l_indiv_id       NUMBER;
+    l_stmt_amount    NUMBER;
 BEGIN
     p_run_id := TO_NUMBER(TO_CHAR(SYSTIMESTAMP, 'YYYYMMDDHH24MISSFF3'));
 
     FOR r IN c_stmt LOOP
 
         BEGIN
-            -- *** NEW: reset flag at the start of each line ***
-            l_candidates_found := FALSE;
-
             xxemr_suggest_line_matches(
                 p_statement_line_id    => r.statement_line_id,
                 p_top_n                => p_top_n,
@@ -2791,9 +2876,6 @@ BEGIN
                 FETCH l_rc INTO l_rank, l_source, l_key, l_amt, l_amt_diff,
                                 l_date_diff, l_ref_score, l_final_score, l_expl, l_combo_size;
                 EXIT WHEN l_rc%NOTFOUND;
-
-                -- *** NEW: at least one row fetched ***
-                l_candidates_found := TRUE;
 
                 l_match_type :=
                     CASE
@@ -2856,10 +2938,12 @@ BEGIN
 
                         INSERT INTO xxemr_match_group_details (
                             match_group_detail_id, match_group_id,
+                            candidate_source,
                             candidate_id, amount, individual_score,
                             amount_diff, max_date_diff_days, reference_score
                         ) VALUES (
                             xxemr_match_grp_dtl_seq.nextval, l_match_group_id,
+                            l_indiv_source,   -- 'AR' or 'EX' — drives FBDI source_code
                             l_indiv_id, l_indiv_amount, l_final_score,
                             ABS(l_stmt_amount - l_indiv_amount), l_date_diff, l_ref_score
                         );
@@ -2869,39 +2953,6 @@ BEGIN
             END LOOP;
 
             CLOSE l_rc;
-
-            -- *** NEW: No candidates returned — stamp NEVER_PROCESSED for
-            --          manual attention, mirroring one-to-one batch behaviour.
-            --          ranking=0 and match_score=0 distinguish these rows from
-            --          genuine suggestions. difference_amount = full stmt amount
-            --          so the reconciler can see the unmatched exposure.
-            --          NOTE: bank_account_id is sourced from the statement line
-            --          because xxemr_run_auto has no p_bank_account_id param. ***
-            IF NOT l_candidates_found THEN
-                BEGIN
-                    SELECT NVL(amount, 0) INTO l_stmt_amount
-                      FROM xxemr_bank_statement_lines
-                     WHERE statement_line_id = r.statement_line_id;
-                EXCEPTION
-                    WHEN NO_DATA_FOUND THEN l_stmt_amount := 0;
-                END;
-
-                INSERT INTO xxemr_match_groups (
-                    match_group_id, statement_line_id, total_match_amount,
-                    difference_amount, match_score, match_type, ranking,
-                    user_action, candidate_source, created_date
-                ) VALUES (
-                    xxemr_match_groups_seq.nextval, r.statement_line_id,
-                    0,                  -- total_match_amount: nothing matched
-                    l_stmt_amount,      -- difference_amount:  full unmatched exposure
-                    0,                  -- match_score:        no score
-                    'ONE_TO_MANY',      -- match_type:         preserve batch context
-                    0,                  -- ranking:            sentinel value
-                    'NEVER_PROCESSED',  -- user_action:        flag for manual review
-                    NULL,               -- candidate_source:   unknown
-                    SYSDATE
-                );
-            END IF;
 
         EXCEPTION
             WHEN OTHERS THEN
@@ -2926,37 +2977,20 @@ BEGIN
     COMMIT;
 
 END xxemr_run_auto;
+
+
 -- ================================================================
 -- PROCEDURE : XXEMR_PROCESS_STATEMENT_ACTION
 -- Purpose   : Central dispatcher procedure triggered from APEX
 --             button. Identifies the user-selected action and
 --             routes to the correct processing procedure.
---
 -- Actions   :
---   BEST POSSIBLE MATCH    — Finds the match group with the
---                            highest score and calls
+--   BEST POSSIBLE MATCH    — highest scoring match group →
 --                            xxemr_apply_ai_match
---   CREATE EXT. TRANSACTION — Creates a new external transaction
---                            by calling
---                            CREATE_ME_EXTERNAL_TRANSACTION
---   MANUAL RECONCILIATION  — Performs manual reconciliation by
---                            calling xxemr_process_manual_match
---
--- Parameters:
---   p_statement_line_id : PK of the selected statement line
---   p_action            : User selected action from APEX
---                         BEST POSSIBLE MATCH
---                         CREATE EXT. TRANSACTION
---                         MANUAL RECONCILIATION
---   p_candidates        : Colon-separated prefixed candidate list
---                         Required only for MANUAL RECONCILIATION
---                         e.g. 'AR1001:EX2002'
---                         Ignored for other actions
---   p_user              : User performing the action
---                         Defaults to SYSTEM
---
+--   CREATE EXT. TRANSACTION — xxemr_create_me_external_transaction
+--   MANUAL RECONCILIATION  — xxemr_process_manual_match
 -- Errors    : -20010  No match group found for BEST POSSIBLE MATCH
---             -20011  Unknown action passed in p_action
+--             -20011  Unknown action
 --             -20012  Statement line not found
 --             -20013  Candidates required for MANUAL RECONCILIATION
 -- ================================================================
@@ -2966,49 +3000,33 @@ PROCEDURE xxemr_process_statement_action (
     p_candidates        IN VARCHAR2 DEFAULT NULL,
     p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
 ) IS
- 
     l_match_group_id   NUMBER;
     l_action           VARCHAR2(100) := UPPER(TRIM(p_action));
     l_line_exists      NUMBER        := 0;
- 
 BEGIN
- 
-    -- -----------------------------------------------------------
-    -- STEP 1: Validate statement line exists
-    -- -----------------------------------------------------------
+    -- Step 1: Validate statement line exists
     SELECT COUNT(*)
       INTO l_line_exists
       FROM xxemr_bank_statement_lines
      WHERE statement_line_id = p_statement_line_id;
- 
+
     IF l_line_exists = 0 THEN
         RAISE_APPLICATION_ERROR(-20012,
             'XXEMR_PROCESS_STATEMENT_ACTION: Statement line not found. '
             || 'LINE_ID=' || p_statement_line_id);
     END IF;
- 
-    -- -----------------------------------------------------------
-    -- STEP 2: Log the incoming action request
-    -- -----------------------------------------------------------
-    XXEMR_BANK_RECONCILIATION_PKG.xxemr_log(
+
+    -- Step 2: Log the incoming action request
+    xxemr_log(
         p_source      => 'STATEMENT_ACTION',
         p_log_message => 'Action received: ' || l_action
                       || ' | LINE_ID='        || p_statement_line_id
                       || ' | USER='           || p_user
     );
- 
-    -- -----------------------------------------------------------
-    -- STEP 3: Route based on action
-    -- -----------------------------------------------------------
+
+    -- Step 3: Route based on action
     IF l_action = 'BEST POSSIBLE MATCH' THEN
- 
-        -- -------------------------------------------------------
-        -- ACTION: BEST POSSIBLE MATCH
-        -- Finds the match group with the highest match score
-        -- for this statement line and applies AI reconciliation
-        -- -------------------------------------------------------
- 
-        -- Step 3a: Get match group with highest score
+
         BEGIN
             SELECT match_group_id
               INTO l_match_group_id
@@ -3023,7 +3041,6 @@ BEGIN
                      WHERE statement_line_id = p_statement_line_id
                    )
              WHERE rnk = 1;
- 
         EXCEPTION
             WHEN NO_DATA_FOUND THEN
                 RAISE_APPLICATION_ERROR(-20010,
@@ -3031,101 +3048,85 @@ BEGIN
                     || 'for BEST POSSIBLE MATCH. '
                     || 'LINE_ID=' || p_statement_line_id);
         END;
- 
-        XXEMR_BANK_RECONCILIATION_PKG.xxemr_log(
+
+        xxemr_log(
             p_source      => 'STATEMENT_ACTION',
             p_log_message => 'Routing to xxemr_apply_ai_match. '
                           || 'LINE_ID='        || p_statement_line_id
                           || ' | MATCH_GROUP=' || l_match_group_id
         );
- 
-        -- Step 3b: Apply AI match using highest scoring group
-        XXEMR_BANK_RECONCILIATION_PKG.xxemr_apply_ai_match(
+
+        xxemr_apply_ai_match(
             p_match_group_id => l_match_group_id,
             p_user           => p_user
         );
- 
-        XXEMR_BANK_RECONCILIATION_PKG.xxemr_log(
+
+        xxemr_log(
             p_source      => 'STATEMENT_ACTION',
             p_log_message => 'BEST POSSIBLE MATCH completed successfully. '
                           || 'LINE_ID='        || p_statement_line_id
                           || ' | MATCH_GROUP=' || l_match_group_id
         );
- 
+
     ELSIF l_action = 'CREATE EXT. TRANSACTION' THEN
- 
-        -- -------------------------------------------------------
-        -- ACTION: CREATE EXT. TRANSACTION
-        -- Creates a new external transaction for the selected
-        -- statement line
-        -- -------------------------------------------------------
-        XXEMR_BANK_RECONCILIATION_PKG.xxemr_log(
+
+        xxemr_log(
             p_source      => 'STATEMENT_ACTION',
-            p_log_message => 'Routing to CREATE_ME_EXTERNAL_TRANSACTION. '
+            p_log_message => 'Routing to xxemr_create_me_external_transaction. '
                           || 'LINE_ID=' || p_statement_line_id
         );
- 
+
         xxemr_create_me_external_transaction(
             p_statement_line_id => p_statement_line_id
         );
- 
-        XXEMR_BANK_RECONCILIATION_PKG.xxemr_log(
+
+        xxemr_log(
             p_source      => 'STATEMENT_ACTION',
             p_log_message => 'CREATE EXT. TRANSACTION completed successfully. '
                           || 'LINE_ID=' || p_statement_line_id
         );
- 
+
     ELSIF l_action = 'MANUAL RECONCILIATION' THEN
- 
-        -- -------------------------------------------------------
-        -- ACTION: MANUAL RECONCILIATION
-        -- Validates candidates are provided then performs full
-        -- manual reconciliation for the statement line
-        -- -------------------------------------------------------
+
         IF p_candidates IS NULL THEN
             RAISE_APPLICATION_ERROR(-20013,
                 'XXEMR_PROCESS_STATEMENT_ACTION: p_candidates is required '
                 || 'for MANUAL RECONCILIATION. '
                 || 'LINE_ID=' || p_statement_line_id);
         END IF;
- 
-        XXEMR_BANK_RECONCILIATION_PKG.xxemr_log(
+
+        xxemr_log(
             p_source      => 'STATEMENT_ACTION',
             p_log_message => 'Routing to xxemr_process_manual_match. '
                           || 'LINE_ID='     || p_statement_line_id
                           || ' | CANDS='    || p_candidates
         );
- 
-        XXEMR_BANK_RECONCILIATION_PKG.xxemr_process_manual_match(
+
+        xxemr_process_manual_match(
             p_statement_line_id => p_statement_line_id,
             p_candidates        => p_candidates,
             p_user              => p_user
         );
- 
-        XXEMR_BANK_RECONCILIATION_PKG.xxemr_log(
+
+        xxemr_log(
             p_source      => 'STATEMENT_ACTION',
             p_log_message => 'MANUAL RECONCILIATION completed successfully. '
                           || 'LINE_ID='  || p_statement_line_id
                           || ' | CANDS=' || p_candidates
         );
- 
+
     ELSE
- 
-        -- -------------------------------------------------------
-        -- Unknown action — raise error
-        -- -------------------------------------------------------
         RAISE_APPLICATION_ERROR(-20011,
             'XXEMR_PROCESS_STATEMENT_ACTION: Unknown action "'
             || p_action || '". Valid values: '
             || 'BEST POSSIBLE MATCH, '
             || 'CREATE EXT. TRANSACTION, '
             || 'MANUAL RECONCILIATION');
- 
     END IF;
- 
+
 EXCEPTION
     WHEN OTHERS THEN
-        XXEMR_BANK_RECONCILIATION_PKG.xxemr_log(
+        xxemr_log(
             p_source      => 'STATEMENT_ACTION',
             p_log_message => 'ERROR during action '  || l_action
                           || ' | LINE_ID=' || p_statement_line_id
@@ -3133,196 +3134,157 @@ EXCEPTION
         );
         ROLLBACK;
         RAISE;
- 
-END XXEMR_PROCESS_STATEMENT_ACTION;
 
-PROCEDURE xxemr_process_statement_action_bulk (
+END xxemr_process_statement_action;
+
+
 -- ================================================================
 -- PROCEDURE : XXEMR_PROCESS_STATEMENT_ACTION_BULK
--- Purpose   : Bulk dispatcher procedure triggered from APEX
---             button. Accepts a single colon-separated parameter
---             where each token contains both the action prefix
---             and the statement line ID.
---
--- Token Format : PREFIX||STATEMENT_LINE_ID
---   NA   — No Action        e.g. NA100005821128748
---   BPM  — Best Possible Match e.g. BPM100005821128748
---   CET  — Create Ext. Transaction e.g. CET100005821128748
---   MR   — Manual Reconciliation e.g. MR100005821128748
---
--- Parameters:
---   p_line_action_tokens : Colon-separated prefixed token list
---                          e.g. 'BPM100001:MR100002:CET100003'
---   p_candidates         : Colon-separated prefixed candidate list
---                          Required only when MR tokens are present
---                          e.g. 'AR1001:EX2002'
---   p_user               : User performing the action
---                          Defaults to SYSTEM
---   p_success_count      : OUT — Successfully processed count
---   p_error_count        : OUT — Failed count
---   p_error_summary      : OUT — Error details per token
+-- Purpose   : Bulk dispatcher triggered from APEX. Accepts a
+--             colon-separated token list where each token contains
+--             an action prefix + statement_line_id.
+-- Token prefixes:
+--   NA   — No Action
+--   BPM  — Best Possible Match
+--   CET  — Create Ext. Transaction
+--   MR   — Manual Reconciliation
 -- ================================================================
-        p_line_action_tokens IN  VARCHAR2,
-        p_candidates         IN  VARCHAR2 DEFAULT NULL,
-        p_user               IN  VARCHAR2 DEFAULT 'SYSTEM',
-        p_success_count      OUT NUMBER,
-        p_error_count        OUT NUMBER,
-        p_error_summary      OUT VARCHAR2
-    ) IS
-        l_remaining    VARCHAR2(4000);
-        l_pos          NUMBER;
-        l_token        VARCHAR2(200);
-        l_prefix       VARCHAR2(10);
-        l_line_id      NUMBER;
-        l_action       VARCHAR2(100);
-    BEGIN
-        p_success_count := 0;
-        p_error_count   := 0;
-        p_error_summary := NULL;
+PROCEDURE xxemr_process_statement_action_bulk (
+    p_line_action_tokens IN  VARCHAR2,
+    p_candidates         IN  VARCHAR2 DEFAULT NULL,
+    p_user               IN  VARCHAR2 DEFAULT 'SYSTEM',
+    p_success_count      OUT NUMBER,
+    p_error_count        OUT NUMBER,
+    p_error_summary      OUT VARCHAR2
+) IS
+    l_remaining    VARCHAR2(4000);
+    l_pos          NUMBER;
+    l_token        VARCHAR2(200);
+    l_prefix       VARCHAR2(10);
+    l_line_id      NUMBER;
+    l_action       VARCHAR2(100);
+BEGIN
+    p_success_count := 0;
+    p_error_count   := 0;
+    p_error_summary := NULL;
 
-        -- -------------------------------------------------------
-        -- Iterate through each prefixed token
-        -- -------------------------------------------------------
-        l_remaining := p_line_action_tokens || ':';
-        LOOP
-            l_pos := INSTR(l_remaining, ':');
-            EXIT WHEN l_pos = 0;
+    l_remaining := p_line_action_tokens || ':';
+    LOOP
+        l_pos := INSTR(l_remaining, ':');
+        EXIT WHEN l_pos = 0;
 
-            l_token     := TRIM(SUBSTR(l_remaining, 1, l_pos - 1));
-            l_remaining := SUBSTR(l_remaining, l_pos + 1);
-            EXIT WHEN l_token IS NULL;
+        l_token     := TRIM(SUBSTR(l_remaining, 1, l_pos - 1));
+        l_remaining := SUBSTR(l_remaining, l_pos + 1);
+        EXIT WHEN l_token IS NULL;
 
-            -- ---------------------------------------------------
-            -- Parse prefix from token
-            -- Prefix is variable length (2-3 chars) so detect
-            -- by checking known prefixes in order of length
-            -- ---------------------------------------------------
-            IF SUBSTR(l_token, 1, 3) = 'BPM' THEN
-                l_prefix  := 'BPM';
-                l_line_id := TO_NUMBER(SUBSTR(l_token, 4));
-                l_action  := 'BEST POSSIBLE MATCH';
+        IF SUBSTR(l_token, 1, 3) = 'BPM' THEN
+            l_prefix  := 'BPM';
+            l_line_id := TO_NUMBER(SUBSTR(l_token, 4));
+            l_action  := 'BEST POSSIBLE MATCH';
 
-            ELSIF SUBSTR(l_token, 1, 3) = 'CET' THEN
-                l_prefix  := 'CET';
-                l_line_id := TO_NUMBER(SUBSTR(l_token, 4));
-                l_action  := 'CREATE EXT. TRANSACTION';
+        ELSIF SUBSTR(l_token, 1, 3) = 'CET' THEN
+            l_prefix  := 'CET';
+            l_line_id := TO_NUMBER(SUBSTR(l_token, 4));
+            l_action  := 'CREATE EXT. TRANSACTION';
 
-            ELSIF SUBSTR(l_token, 1, 2) = 'MR' THEN
-                l_prefix  := 'MR';
-                l_line_id := TO_NUMBER(SUBSTR(l_token, 3));
-                l_action  := 'MANUAL RECONCILIATION';
+        ELSIF SUBSTR(l_token, 1, 2) = 'MR' THEN
+            l_prefix  := 'MR';
+            l_line_id := TO_NUMBER(SUBSTR(l_token, 3));
+            l_action  := 'MANUAL RECONCILIATION';
 
-            ELSIF SUBSTR(l_token, 1, 2) = 'NA' THEN
-                l_prefix  := 'NA';
-                l_line_id := TO_NUMBER(SUBSTR(l_token, 3));
-                l_action  := 'NO ACTION';
+        ELSIF SUBSTR(l_token, 1, 2) = 'NA' THEN
+            l_prefix  := 'NA';
+            l_line_id := TO_NUMBER(SUBSTR(l_token, 3));
+            l_action  := 'NO ACTION';
 
-            ELSE
-                -- Unknown prefix — log and skip
-                p_error_count   := p_error_count + 1;
-                p_error_summary := p_error_summary
-                                || 'TOKEN=' || l_token
-                                || ' | ERROR=Unknown prefix. '
-                                || 'Valid prefixes: NA, BPM, CET, MR'
-                                || ' || ';
+        ELSE
+            p_error_count   := p_error_count + 1;
+            p_error_summary := p_error_summary
+                            || 'TOKEN=' || l_token
+                            || ' | ERROR=Unknown prefix. '
+                            || 'Valid prefixes: NA, BPM, CET, MR'
+                            || ' || ';
+            xxemr_log(
+                p_source      => 'BULK_ACTION',
+                p_log_message => 'Unknown prefix in token: ' || l_token
+            );
+            CONTINUE;
+        END IF;
 
-                xxemr_log(
-                    p_source      => 'BULK_ACTION',
-                    p_log_message => 'Unknown prefix in token: ' || l_token
-                );
-                CONTINUE;
-            END IF;
+        IF l_prefix = 'NA' THEN
+            xxemr_log(
+                p_source      => 'BULK_ACTION',
+                p_log_message => 'Skipped — No Action. LINE_ID=' || l_line_id
+            );
+            CONTINUE;
+        END IF;
 
-            -- ---------------------------------------------------
-            -- Skip NA — No Action required
-            -- ---------------------------------------------------
-            IF l_prefix = 'NA' THEN
-                xxemr_log(
-                    p_source      => 'BULK_ACTION',
-                    p_log_message => 'Skipped — No Action. '
-                                  || 'LINE_ID=' || l_line_id
-                );
-                CONTINUE;
-            END IF;
+        IF l_prefix = 'MR' AND p_candidates IS NULL THEN
+            p_error_count   := p_error_count + 1;
+            p_error_summary := p_error_summary
+                            || 'LINE_ID=' || l_line_id
+                            || ' | ACTION=' || l_action
+                            || ' | ERROR=Candidates required for MANUAL RECONCILIATION'
+                            || ' || ';
+            xxemr_log(
+                p_source      => 'BULK_ACTION',
+                p_log_message => 'Skipped — candidates required. LINE_ID=' || l_line_id
+            );
+            CONTINUE;
+        END IF;
 
-            -- ---------------------------------------------------
-            -- Guard: MR requires candidates
-            -- ---------------------------------------------------
-            IF l_prefix = 'MR' AND p_candidates IS NULL THEN
+        BEGIN
+            xxemr_process_statement_action(
+                p_statement_line_id => l_line_id,
+                p_action            => l_action,
+                p_candidates        => p_candidates,
+                p_user              => p_user
+            );
+
+            p_success_count := p_success_count + 1;
+
+            xxemr_log(
+                p_source      => 'BULK_ACTION',
+                p_log_message => 'Processed successfully. '
+                              || 'LINE_ID=' || l_line_id
+                              || ' | ACTION=' || l_action
+            );
+
+        EXCEPTION
+            WHEN OTHERS THEN
                 p_error_count   := p_error_count + 1;
                 p_error_summary := p_error_summary
                                 || 'LINE_ID=' || l_line_id
                                 || ' | ACTION=' || l_action
-                                || ' | ERROR=Candidates required for MANUAL RECONCILIATION'
+                                || ' | ERROR='  || SQLERRM
                                 || ' || ';
-
                 xxemr_log(
                     p_source      => 'BULK_ACTION',
-                    p_log_message => 'Skipped — candidates required. '
-                                  || 'LINE_ID=' || l_line_id
-                );
-                CONTINUE;
-            END IF;
-
-            -- ---------------------------------------------------
-            -- Process the line + action
-            -- ---------------------------------------------------
-            BEGIN
-                xxemr_process_statement_action(
-                    p_statement_line_id => l_line_id,
-                    p_action            => l_action,
-                    p_candidates        => p_candidates,
-                    p_user              => p_user
-                );
-
-                p_success_count := p_success_count + 1;
-
-                xxemr_log(
-                    p_source      => 'BULK_ACTION',
-                    p_log_message => 'Processed successfully. '
-                                  || 'LINE_ID=' || l_line_id
+                    p_log_message => 'Failed. LINE_ID=' || l_line_id
                                   || ' | ACTION=' || l_action
+                                  || ' | ERROR=' || SQLERRM
                 );
+        END;
 
-            EXCEPTION
-                WHEN OTHERS THEN
-                    p_error_count   := p_error_count + 1;
-                    p_error_summary := p_error_summary
-                                    || 'LINE_ID=' || l_line_id
-                                    || ' | ACTION=' || l_action
-                                    || ' | ERROR='  || SQLERRM
-                                    || ' || ';
+    END LOOP;
 
-                    xxemr_log(
-                        p_source      => 'BULK_ACTION',
-                        p_log_message => 'Failed. '
-                                      || 'LINE_ID=' || l_line_id
-                                      || ' | ACTION=' || l_action
-                                      || ' | ERROR=' || SQLERRM
-                    );
-            END;
+    xxemr_log(
+        p_source      => 'BULK_ACTION',
+        p_log_message => 'Bulk completed. '
+                      || 'SUCCESS=' || p_success_count
+                      || ' | ERRORS=' || p_error_count
+    );
 
-        END LOOP;
-
-        -- -------------------------------------------------------
-        -- Log final summary
-        -- -------------------------------------------------------
+EXCEPTION
+    WHEN OTHERS THEN
         xxemr_log(
             p_source      => 'BULK_ACTION',
-            p_log_message => 'Bulk completed. '
-                          || 'SUCCESS=' || p_success_count
-                          || ' | ERRORS=' || p_error_count
+            p_log_message => 'Bulk failed unexpectedly. ERROR=' || SQLERRM
         );
+        RAISE;
 
-    EXCEPTION
-        WHEN OTHERS THEN
-            xxemr_log(
-                p_source      => 'BULK_ACTION',
-                p_log_message => 'Bulk failed unexpectedly. ERROR=' || SQLERRM
-            );
-            RAISE;
+END xxemr_process_statement_action_bulk;
 
-    END xxemr_process_statement_action_bulk;
 
 END XXEMR_BANK_RECONCILIATION_PKG;
 /
