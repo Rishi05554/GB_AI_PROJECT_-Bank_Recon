@@ -1,4 +1,4 @@
-create or replace PROCEDURE xxemr_dispatch_fbdi_to_oic (
+CREATE OR REPLACE PROCEDURE xxemr_dispatch_fbdi_to_oic (
     p_batch_size   IN NUMBER DEFAULT 100,
     p_max_attempts IN NUMBER DEFAULT 2
 ) AS
@@ -84,6 +84,11 @@ create or replace PROCEDURE xxemr_dispatch_fbdi_to_oic (
             || l_id_count    || ' lines');
 
         BEGIN
+            -- Set Content-Type so OIC accepts the JSON payload
+            apex_web_service.g_request_headers.DELETE;
+            apex_web_service.g_request_headers(1).name  := 'Content-Type';
+            apex_web_service.g_request_headers(1).value := 'application/json';
+
             l_api_response := SUBSTR(
                 apex_web_service.make_rest_request(
                     p_url         => v_endpoint,
@@ -293,4 +298,3 @@ EXCEPTION
         RAISE;
 
 END xxemr_dispatch_fbdi_to_oic;
-/
