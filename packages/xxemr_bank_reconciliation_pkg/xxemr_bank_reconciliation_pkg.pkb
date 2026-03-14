@@ -1,4 +1,4 @@
-create or replace PACKAGE BODY XXEMR_BANK_RECONCILIATION_PKG AS
+CREATE OR REPLACE PACKAGE BODY XXEMR_BANK_RECONCILIATION_PKG AS
 
 -- ================================================================
 -- PACKAGE BODY : XXEMR_BANK_RECONCILIATION_PKG
@@ -647,21 +647,23 @@ BEGIN
       FROM xxemr_match_group_details
      WHERE match_group_id = p_match_group_id;
 
-    -- Step 3: Insert FBDI staging rows (source of truth for OIC loading).
-    --         Done before any status updates so that if FBDI insert fails
-    --         the whole transaction rolls back cleanly.
+    -- Step 3: Stamp REJECTED on all match groups for this line,
+    --         then ACCEPTED on the selected group.
     IF p_match_group_id IS NOT NULL THEN
-    
-        UPDATE XXEMR_MATCH_GROUPS
-        SET USER_ACTION='REJECTED'
-        WHERE STATEMENT_LINE_ID=l_statement_line_id;
 
-        UPDATE XXEMR_MATCH_GROUPS
-        SET USER_ACTION='ACCEPTED'
-        WHERE MATCH_GROUP_ID=p_match_group_id;
+        UPDATE xxemr_match_groups
+           SET user_action = 'REJECTED'
+         WHERE statement_line_id = l_statement_line_id;
+
+        UPDATE xxemr_match_groups
+           SET user_action = 'ACCEPTED'
+         WHERE match_group_id = p_match_group_id;
 
     END IF;
 
+    -- Step 4: Insert FBDI staging rows (source of truth for OIC loading).
+    --         Done before status updates so that if FBDI insert fails
+    --         the whole transaction rolls back cleanly.
     xxemr_insert_fbdi_lines(
         p_statement_line_id => l_statement_line_id,
         p_candidates        => l_candidates,
@@ -670,7 +672,23 @@ BEGIN
         p_user              => p_user
     );
 
-    -- -- Step 4: Apply reconciliation status
+    -- Step 5: Clean up any EXT_PENDING / EXT_PARTIAL / EXT_CREATED groups
+    --         that are no longer relevant now an AI match is accepted.
+    DELETE FROM xxemr_match_group_details
+     WHERE match_group_id IN (
+               SELECT match_group_id FROM xxemr_match_groups
+                WHERE statement_line_id = l_statement_line_id
+                  AND match_type IN ('EXT_PENDING','EXT_PARTIAL','EXT_CREATED')
+                  AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN'
+           );
+
+    DELETE FROM xxemr_match_groups
+     WHERE statement_line_id = l_statement_line_id
+       AND match_type IN ('EXT_PENDING','EXT_PARTIAL','EXT_CREATED')
+       AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN';
+
+    -- Step 6: xxemr_update_recon_status is intentionally commented out.
+    --         Recon status is updated downstream by OIC after FBDI load.
     -- xxemr_update_recon_status(
     --     p_statement_line_id => l_statement_line_id,
     --     p_candidates        => l_candidates,
@@ -742,6 +760,8 @@ BEGIN
     apex_web_service.g_request_headers.DELETE;
     apex_web_service.g_request_headers(1).name  := 'Content-Type';
     apex_web_service.g_request_headers(1).value := 'application/json';
+
+    log_step(NULL, NULL, 'FUSION_PAYLOAD', 'DEBUG', v_payload);
 
     x_api_response := apex_web_service.make_rest_request(
         p_url         => v_endpoint,
@@ -1698,12 +1718,15 @@ IS
     v_creation_amount   NUMBER         := NULL;
 BEGIN
     BEGIN
-        SELECT * INTO v_stmt
-          FROM XXEMR_BANK_STATEMENT_LINES
-         WHERE statement_line_id    = p_statement_line_id
-           AND approval_status      = 'PENDING'
-           AND is_profit_withdrawal = 'Y'
-           AND pw_action            = 'PENDING_APPROVAL'
+        SELECT s.* INTO v_stmt
+          FROM xxemr_bank_statement_lines s
+         WHERE s.statement_line_id = p_statement_line_id
+           AND NVL(s.ext_tx_created_flag,'N') <> 'Y'
+           AND EXISTS (
+                   SELECT 1 FROM xxemr_match_groups g
+                    WHERE g.statement_line_id = s.statement_line_id
+                      AND g.match_type IN ('EXT_PENDING','EXT_PARTIAL')
+               )
         FOR UPDATE NOWAIT;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN
@@ -1735,7 +1758,7 @@ BEGIN
      WHERE statement_line_id = p_statement_line_id;
     COMMIT;
 
-    DECLARE
+    /* DECLARE
         v_escrow_flag VARCHAR2(10);
     BEGIN
         SELECT NVL(h.escrow_account,'N')
@@ -1764,8 +1787,8 @@ BEGIN
         END IF;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN v_txn_type := v_stmt.trx_type;
-    END;
-
+    END; */
+    v_txn_type := v_stmt.trx_type;
     v_creation_amount :=
         CASE UPPER(v_stmt.flow_indicator)
             WHEN 'DBIT' THEN -1 * ABS(v_stmt.amount)
@@ -1794,12 +1817,13 @@ BEGIN
                ai_created_flag    = 'Y',
                dashboard_flag     = 'N',
                dashboard_message  = NULL,
+               recon_status       = 'REC',
                last_updated       = SYSTIMESTAMP
          WHERE statement_line_id = p_statement_line_id;
 
         UPDATE xxemr_match_groups
            SET match_type       = 'EXT_CREATED',
-               user_action      = NVL(V('APP_USER'), 'SYSTEM'),
+               user_action      = 'ACTION_TAKEN',
                last_update_date = SYSTIMESTAMP,
                last_updated_by  = NVL(V('APP_USER'), 'SYSTEM')
          WHERE statement_line_id = p_statement_line_id
@@ -1863,13 +1887,15 @@ IS
     v_creation_amount   NUMBER         := NULL;
 BEGIN
     BEGIN
-        SELECT * INTO v_stmt
-          FROM XXEMR_BANK_STATEMENT_LINES
-         WHERE statement_line_id    = p_statement_line_id
-           AND approval_status      = 'PENDING'
-           AND external_flag        = 'Y'
-           AND month_end_check_done = 'Y'
-           AND month_end_action     = 'PENDING_APPROVAL'
+        SELECT s.* INTO v_stmt
+          FROM xxemr_bank_statement_lines s
+         WHERE s.statement_line_id = p_statement_line_id
+           AND NVL(s.ext_tx_created_flag,'N') <> 'Y'
+           AND EXISTS (
+                   SELECT 1 FROM xxemr_match_groups g
+                    WHERE g.statement_line_id = s.statement_line_id
+                      AND g.match_type IN ('EXT_PENDING','EXT_PARTIAL')
+               )
         FOR UPDATE NOWAIT;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN
@@ -1901,7 +1927,7 @@ BEGIN
      WHERE statement_line_id = p_statement_line_id;
     COMMIT;
 
-    DECLARE
+  /*   DECLARE
         v_escrow_flag VARCHAR2(10);
     BEGIN
         SELECT NVL(h.escrow_account,'N')
@@ -1930,8 +1956,8 @@ BEGIN
         END IF;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN v_txn_type := v_stmt.trx_type;
-    END;
-
+    END; */
+    v_txn_type := v_stmt.trx_type;
     v_creation_amount :=
         CASE UPPER(v_stmt.flow_indicator)
             WHEN 'DBIT' THEN -1 * ABS(v_stmt.amount)
@@ -1960,16 +1986,46 @@ BEGIN
                ai_created_flag    = 'Y',
                dashboard_flag     = 'N',
                dashboard_message  = NULL,
+               recon_status       = 'REC',
                last_updated       = SYSTIMESTAMP
          WHERE statement_line_id = p_statement_line_id;
 
+        -- Clean up superseded AI suggestions now that external transaction is created.
+        DELETE FROM xxemr_match_group_details
+         WHERE match_group_id IN (
+                   SELECT match_group_id FROM xxemr_match_groups
+                    WHERE statement_line_id = p_statement_line_id
+                      AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
+                      AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN'
+               );
+
+        DELETE FROM xxemr_match_groups
+         WHERE statement_line_id = p_statement_line_id
+           AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
+           AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN';
+
         UPDATE xxemr_match_groups
            SET match_type       = 'EXT_CREATED',
-               user_action      = NVL(V('APP_USER'), 'SYSTEM'),
+               user_action      = 'ACTION_TAKEN',
                last_update_date = SYSTIMESTAMP,
                last_updated_by  = NVL(V('APP_USER'), 'SYSTEM')
          WHERE statement_line_id = p_statement_line_id
            AND match_type        IN ('EXT_PENDING', 'EXT_PARTIAL');
+
+        -- Clean up any ONE_TO_ONE / ONE_TO_MANY AI suggestions that
+        -- are now superseded by the external transaction creation.
+        DELETE FROM xxemr_match_group_details
+         WHERE match_group_id IN (
+                   SELECT match_group_id FROM xxemr_match_groups
+                    WHERE statement_line_id = p_statement_line_id
+                      AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
+                      AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN'
+               );
+
+        DELETE FROM xxemr_match_groups
+         WHERE statement_line_id = p_statement_line_id
+           AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
+           AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN';
 
         COMMIT;
         log_step(NULL, p_statement_line_id, 'ME_CREATE', 'SUCCESS',
@@ -2645,6 +2701,7 @@ PROCEDURE xxemr_run_batch (
     l_indiv_source   VARCHAR2(10);
     l_indiv_id       NUMBER;
     l_stmt_amount    NUMBER;
+    l_candidates_found BOOLEAN;        -- TRUE when >=1 candidate fetched
 BEGIN
     -- Delete PENDING suggestions; preserve ACTION_TAKEN and MANUAL_RECON
     DELETE FROM xxemr_match_group_details
@@ -2676,6 +2733,7 @@ BEGIN
     FOR r IN c_stmt LOOP
 
         BEGIN
+            l_candidates_found := FALSE;  -- reset for each statement line
             xxemr_suggest_line_matches(
                 p_statement_line_id    => r.statement_line_id,
                 p_top_n                => p_top_n,
@@ -2694,6 +2752,7 @@ BEGIN
                 FETCH l_rc INTO l_rank, l_source, l_key, l_amt, l_amt_diff,
                                 l_date_diff, l_ref_score, l_final_score, l_expl, l_combo_size;
                 EXIT WHEN l_rc%NOTFOUND;
+                l_candidates_found := TRUE;
 
                 l_match_type :=
                     CASE
@@ -2771,6 +2830,29 @@ BEGIN
             END LOOP;
 
             CLOSE l_rc;
+            -- No candidates found → insert NEVER_PROCESSED sentinel so the
+            -- line is visible in the UI and won't be re-processed endlessly.
+            IF NOT l_candidates_found THEN
+                BEGIN
+                    SELECT NVL(amount, 0) INTO l_stmt_amount
+                      FROM xxemr_bank_statement_lines
+                     WHERE statement_line_id = r.statement_line_id;
+                EXCEPTION
+                    WHEN NO_DATA_FOUND THEN l_stmt_amount := 0;
+                END;
+
+                INSERT INTO xxemr_match_groups (
+                    match_group_id,      statement_line_id,   total_match_amount,
+                    difference_amount,   match_score,         match_type,
+                    ranking,             user_action,         candidate_source,
+                    created_date
+                ) VALUES (
+                    xxemr_match_groups_seq.nextval, r.statement_line_id, 0,
+                    l_stmt_amount, 0, 'ONE_TO_MANY', 0,
+                    'NEVER_PROCESSED', NULL, SYSDATE
+                );
+            END IF;
+
 
         EXCEPTION
             WHEN OTHERS THEN
@@ -2852,12 +2934,14 @@ PROCEDURE xxemr_run_auto (
     l_indiv_source   VARCHAR2(10);
     l_indiv_id       NUMBER;
     l_stmt_amount    NUMBER;
+    l_candidates_found BOOLEAN;        -- TRUE when >=1 candidate fetched
 BEGIN
     p_run_id := TO_NUMBER(TO_CHAR(SYSTIMESTAMP, 'YYYYMMDDHH24MISSFF3'));
 
     FOR r IN c_stmt LOOP
 
         BEGIN
+            l_candidates_found := FALSE;  -- reset for each statement line
             xxemr_suggest_line_matches(
                 p_statement_line_id    => r.statement_line_id,
                 p_top_n                => p_top_n,
@@ -2876,6 +2960,7 @@ BEGIN
                 FETCH l_rc INTO l_rank, l_source, l_key, l_amt, l_amt_diff,
                                 l_date_diff, l_ref_score, l_final_score, l_expl, l_combo_size;
                 EXIT WHEN l_rc%NOTFOUND;
+                l_candidates_found := TRUE;
 
                 l_match_type :=
                     CASE
@@ -2953,6 +3038,28 @@ BEGIN
             END LOOP;
 
             CLOSE l_rc;
+            -- No candidates found → insert NEVER_PROCESSED sentinel.
+            IF NOT l_candidates_found THEN
+                BEGIN
+                    SELECT NVL(amount, 0) INTO l_stmt_amount
+                      FROM xxemr_bank_statement_lines
+                     WHERE statement_line_id = r.statement_line_id;
+                EXCEPTION
+                    WHEN NO_DATA_FOUND THEN l_stmt_amount := 0;
+                END;
+
+                INSERT INTO xxemr_match_groups (
+                    match_group_id,      statement_line_id,   total_match_amount,
+                    difference_amount,   match_score,         match_type,
+                    ranking,             user_action,         candidate_source,
+                    created_date
+                ) VALUES (
+                    xxemr_match_groups_seq.nextval, r.statement_line_id, 0,
+                    l_stmt_amount, 0, 'ONE_TO_MANY', 0,
+                    'NEVER_PROCESSED', NULL, SYSDATE
+                );
+            END IF;
+
 
         EXCEPTION
             WHEN OTHERS THEN
