@@ -1,4 +1,4 @@
-create or replace PACKAGE XXEMR_BANK_RECONCILIATION_PKG AS
+CREATE OR REPLACE PACKAGE XXEMR_BANK_RECONCILIATION_PKG AS
 
 -- ================================================================
 -- PACKAGE SPEC : XXEMR_BANK_RECONCILIATION_PKG
@@ -43,15 +43,33 @@ PROCEDURE xxemr_process_manual_match (
 PROCEDURE xxemr_apply_ai_match (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_apply_ai_match
--- Purpose   : Applies a pre-generated AI match group by stamping
---             AI_RECONCILED status on the statement line and all
---             candidate records linked via the match group.
+-- Purpose   : Records the user's group selection from the APEX
+--             popup (Apply Selection button). Stamps REJECTED on
+--             all groups for the line and ACCEPTED on the chosen
+--             group. Does NOT insert FBDI rows — call
+--             xxemr_confirm_ai_match via Process Selected Action.
 -- Parameters:
---   p_match_group_id  — ID of the match group to apply
+--   p_match_group_id  — ID of the match group selected by the user
 --   p_user            — user performing the action
 -- ----------------------------------------------------------------
     p_match_group_id IN NUMBER,
     p_user           IN VARCHAR2 DEFAULT 'SYSTEM'
+);
+
+
+PROCEDURE xxemr_confirm_ai_match (
+-- ----------------------------------------------------------------
+-- PROCEDURE : xxemr_confirm_ai_match
+-- Purpose   : Called by Process Selected Action (BPM). Finds the
+--             ACCEPTED match group, inserts FBDI staging rows for
+--             OIC dispatch, and cleans up superseded EXT groups.
+--             This is the procedure that triggers OIC loading.
+-- Parameters:
+--   p_statement_line_id — statement line being confirmed
+--   p_user              — user performing the action
+-- ----------------------------------------------------------------
+    p_statement_line_id IN NUMBER,
+    p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
 );
 
 
@@ -290,33 +308,6 @@ PROCEDURE xxemr_run_auto (
     p_commit_interval      IN  NUMBER   DEFAULT 200
 );
 
--- ================================================================
--- SECTION 0 — STATEMENT ACTION ROUTER
--- ================================================================
 
-PROCEDURE xxemr_process_statement_action (
--- ----------------------------------------------------------------
--- PROCEDURE : xxemr_process_statement_action
--- Purpose   : Routes APEX UI actions for a statement line.
---             Supports:
---               BEST POSSIBLE MATCH
---               CREATE EXT. TRANSACTION
---               MANUAL RECONCILIATION
--- ----------------------------------------------------------------
-    p_statement_line_id IN NUMBER,
-    p_action            IN VARCHAR2,
-    p_candidates        IN VARCHAR2 DEFAULT NULL,
-    p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
-);
-
-PROCEDURE xxemr_process_statement_action_bulk(
-    p_line_action_tokens IN  VARCHAR2,
-    p_candidates         IN  VARCHAR2 DEFAULT NULL,  
-    p_user               IN  VARCHAR2 DEFAULT 'SYSTEM',
-    p_success_count      OUT NUMBER,
-    p_error_count        OUT NUMBER,
-    p_error_summary      OUT VARCHAR2
-);
-    
 END XXEMR_BANK_RECONCILIATION_PKG;
 /
