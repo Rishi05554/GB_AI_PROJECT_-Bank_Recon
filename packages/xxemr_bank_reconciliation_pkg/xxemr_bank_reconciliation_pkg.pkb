@@ -41,7 +41,6 @@ PROCEDURE xxemr_insert_fbdi_lines (
     p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
 );
 
-
 -- ================================================================
 -- SECTION 1 — CORE UTILITIES
 -- ================================================================
@@ -649,6 +648,11 @@ BEGIN
 
     -- Step 3: Stamp REJECTED on all match groups for this line,
     --         then ACCEPTED on the selected group.
+    --
+    -- NOTE: This is called by the APEX "Apply Selection" button only.
+    --       It records the user's selection.  FBDI insert and OIC
+    --       submission happen later in xxemr_confirm_ai_match, which
+    --       is triggered by "Process Selected Action" (BPM).
     IF p_match_group_id IS NOT NULL THEN
 
         UPDATE xxemr_match_groups
@@ -660,42 +664,6 @@ BEGIN
          WHERE match_group_id = p_match_group_id;
 
     END IF;
-
-    -- Step 4: Insert FBDI staging rows (source of truth for OIC loading).
-    --         Done before status updates so that if FBDI insert fails
-    --         the whole transaction rolls back cleanly.
-    xxemr_insert_fbdi_lines(
-        p_statement_line_id => l_statement_line_id,
-        p_candidates        => l_candidates,
-        p_recon_method      => 'AI',
-        p_match_group_id    => p_match_group_id,
-        p_user              => p_user
-    );
-
-    -- Step 5: Clean up any EXT_PENDING / EXT_PARTIAL / EXT_CREATED groups
-    --         that are no longer relevant now an AI match is accepted.
-    DELETE FROM xxemr_match_group_details
-     WHERE match_group_id IN (
-               SELECT match_group_id FROM xxemr_match_groups
-                WHERE statement_line_id = l_statement_line_id
-                  AND match_type IN ('EXT_PENDING','EXT_PARTIAL','EXT_CREATED')
-                  AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN'
-           );
-
-    DELETE FROM xxemr_match_groups
-     WHERE statement_line_id = l_statement_line_id
-       AND match_type IN ('EXT_PENDING','EXT_PARTIAL','EXT_CREATED')
-       AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN';
-
-    -- Step 6: xxemr_update_recon_status is intentionally commented out.
-    --         Recon status is updated downstream by OIC after FBDI load.
-    -- xxemr_update_recon_status(
-    --     p_statement_line_id => l_statement_line_id,
-    --     p_candidates        => l_candidates,
-    --     p_status            => 'AI_RECONCILED',
-    --     p_match_flag        => 'Y',
-    --     p_user              => p_user
-    -- );
 
     COMMIT;
 
@@ -709,6 +677,82 @@ EXCEPTION
         ROLLBACK;
         RAISE;
 END xxemr_apply_ai_match;
+
+
+-- ================================================================
+-- PROCEDURE : xxemr_confirm_ai_match
+-- Purpose   : Called by "Process Selected Action" (BPM action).
+--             Finds the ACCEPTED match group for the statement line,
+--             inserts FBDI staging rows for OIC dispatch, and
+--             cleans up superseded EXT groups.
+--
+--             Kept separate from xxemr_apply_ai_match so that
+--             "Apply Selection" (group picker) never triggers an
+--             FBDI insert — only the explicit confirm action does.
+-- ================================================================
+PROCEDURE xxemr_confirm_ai_match (
+    p_statement_line_id IN NUMBER,
+    p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
+) IS
+    l_match_group_id  NUMBER;
+    l_candidates      VARCHAR2(4000);
+BEGIN
+    -- Step 1: Find the ACCEPTED match group for this line
+    BEGIN
+        SELECT match_group_id
+          INTO l_match_group_id
+          FROM xxemr_match_groups
+         WHERE statement_line_id = p_statement_line_id
+           AND user_action        = 'ACCEPTED'
+           AND ROWNUM             = 1;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20014,
+                'xxemr_confirm_ai_match: No ACCEPTED match group found for '
+                || 'LINE_ID=' || p_statement_line_id
+                || '. User must select a group via Apply Selection first.');
+    END;
+
+    -- Step 2: Build candidate token list from match group details
+    SELECT LISTAGG(candidate_source || candidate_id, ':')
+           WITHIN GROUP (ORDER BY candidate_id)
+      INTO l_candidates
+      FROM xxemr_match_group_details
+     WHERE match_group_id = l_match_group_id;
+
+    -- Step 3: Insert FBDI staging rows — source of truth for OIC.
+    --         Done before EXT cleanup so a failure rolls back cleanly.
+    xxemr_insert_fbdi_lines(
+        p_statement_line_id => p_statement_line_id,
+        p_candidates        => l_candidates,
+        p_recon_method      => 'AI',
+        p_match_group_id    => l_match_group_id,
+        p_user              => p_user
+    );
+
+    -- Step 4: Clean up any EXT_PENDING / EXT_PARTIAL / EXT_CREATED groups
+    --         superseded now that an AI match is confirmed.
+    DELETE FROM xxemr_match_group_details
+     WHERE match_group_id IN (
+               SELECT match_group_id FROM xxemr_match_groups
+                WHERE statement_line_id = p_statement_line_id
+                  AND match_type IN ('EXT_PENDING','EXT_PARTIAL','EXT_CREATED')
+                  AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN'
+           );
+
+    DELETE FROM xxemr_match_groups
+     WHERE statement_line_id = p_statement_line_id
+       AND match_type IN ('EXT_PENDING','EXT_PARTIAL','EXT_CREATED')
+       AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN';
+
+    COMMIT;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END xxemr_confirm_ai_match;
+
 
 
 -- ================================================================
@@ -1758,7 +1802,7 @@ BEGIN
      WHERE statement_line_id = p_statement_line_id;
     COMMIT;
 
-    /* DECLARE
+    DECLARE
         v_escrow_flag VARCHAR2(10);
     BEGIN
         SELECT NVL(h.escrow_account,'N')
@@ -1787,8 +1831,8 @@ BEGIN
         END IF;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN v_txn_type := v_stmt.trx_type;
-    END; */
-    v_txn_type := v_stmt.trx_type;
+    END;
+
     v_creation_amount :=
         CASE UPPER(v_stmt.flow_indicator)
             WHEN 'DBIT' THEN -1 * ABS(v_stmt.amount)
@@ -1927,7 +1971,7 @@ BEGIN
      WHERE statement_line_id = p_statement_line_id;
     COMMIT;
 
-  /*   DECLARE
+    DECLARE
         v_escrow_flag VARCHAR2(10);
     BEGIN
         SELECT NVL(h.escrow_account,'N')
@@ -1956,8 +2000,8 @@ BEGIN
         END IF;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN v_txn_type := v_stmt.trx_type;
-    END; */
-    v_txn_type := v_stmt.trx_type;
+    END;
+
     v_creation_amount :=
         CASE UPPER(v_stmt.flow_indicator)
             WHEN 'DBIT' THEN -1 * ABS(v_stmt.amount)
@@ -2423,8 +2467,8 @@ PROCEDURE xxemr_suggest_line_matches (
     p_top_n                IN  NUMBER   DEFAULT 3,
     p_date_window_days     IN  NUMBER   DEFAULT 15,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
-    p_max_combo_size       IN  NUMBER   DEFAULT 5,
-    p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
+    p_max_combo_size       IN  NUMBER   DEFAULT 3,
+    p_max_receipt_pool     IN  NUMBER   DEFAULT 60,
     p_include_external_txn IN  VARCHAR2 DEFAULT 'Y',
     p_allow_one_to_many    IN  VARCHAR2 DEFAULT 'Y',
     p_result               OUT SYS_REFCURSOR
@@ -2659,9 +2703,9 @@ PROCEDURE xxemr_run_batch (
     p_top_n                IN  NUMBER   DEFAULT 3,
     p_date_window_days     IN  NUMBER   DEFAULT 15,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
-    p_max_combo_size       IN  NUMBER   DEFAULT 5,
-    p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
-    p_commit_interval      IN  NUMBER   DEFAULT 200
+    p_max_combo_size       IN  NUMBER   DEFAULT 3,
+    p_max_receipt_pool     IN  NUMBER   DEFAULT 60,
+    p_commit_interval      IN  NUMBER   DEFAULT 500
 ) IS
     CURSOR c_stmt IS
         SELECT s.statement_line_id,
@@ -2892,9 +2936,9 @@ PROCEDURE xxemr_run_auto (
     p_top_n                IN  NUMBER   DEFAULT 3,
     p_date_window_days     IN  NUMBER   DEFAULT 15,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
-    p_max_combo_size       IN  NUMBER   DEFAULT 5,
-    p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
-    p_commit_interval      IN  NUMBER   DEFAULT 200
+    p_max_combo_size       IN  NUMBER   DEFAULT 3,
+    p_max_receipt_pool     IN  NUMBER   DEFAULT 60,
+    p_commit_interval      IN  NUMBER   DEFAULT 500
 ) IS
     -- Rolling 3-month window; NOT EXISTS ensures incremental only
     CURSOR c_stmt IS
@@ -3134,43 +3178,68 @@ BEGIN
     -- Step 3: Route based on action
     IF l_action = 'BEST POSSIBLE MATCH' THEN
 
+        -- Find the ACCEPTED group (set by Apply Selection in the popup).
+        -- If the user skipped Apply Selection and clicked BPM directly,
+        -- auto-accept the highest scoring group first.
         BEGIN
             SELECT match_group_id
               INTO l_match_group_id
-              FROM (
-                    SELECT match_group_id,
-                           match_score,
-                           RANK() OVER (
-                               ORDER BY match_score DESC,
-                                        created_date DESC
-                           ) AS rnk
-                      FROM xxemr_match_groups
-                     WHERE statement_line_id = p_statement_line_id
-                   )
-             WHERE rnk = 1;
+              FROM xxemr_match_groups
+             WHERE statement_line_id = p_statement_line_id
+               AND user_action        = 'ACCEPTED'
+               AND ROWNUM             = 1;
         EXCEPTION
             WHEN NO_DATA_FOUND THEN
-                RAISE_APPLICATION_ERROR(-20010,
-                    'XXEMR_PROCESS_STATEMENT_ACTION: No match group found '
-                    || 'for BEST POSSIBLE MATCH. '
-                    || 'LINE_ID=' || p_statement_line_id);
+                -- No explicit selection — auto-pick highest score
+                BEGIN
+                    SELECT match_group_id
+                      INTO l_match_group_id
+                      FROM (
+                            SELECT match_group_id,
+                                   RANK() OVER (
+                                       ORDER BY match_score DESC,
+                                                created_date DESC
+                                   ) AS rnk
+                              FROM xxemr_match_groups
+                             WHERE statement_line_id = p_statement_line_id
+                               AND NVL(user_action,'PENDING') NOT IN ('REJECTED')
+                           )
+                     WHERE rnk = 1;
+
+                    -- Stamp REJECTED/ACCEPTED so confirm proc can find it
+                    UPDATE xxemr_match_groups
+                       SET user_action = 'REJECTED'
+                     WHERE statement_line_id = p_statement_line_id;
+
+                    UPDATE xxemr_match_groups
+                       SET user_action = 'ACCEPTED'
+                     WHERE match_group_id = l_match_group_id;
+
+                    COMMIT;
+                EXCEPTION
+                    WHEN NO_DATA_FOUND THEN
+                        RAISE_APPLICATION_ERROR(-20010,
+                            'XXEMR_PROCESS_STATEMENT_ACTION: No match group found '
+                            || 'for BEST POSSIBLE MATCH. '
+                            || 'LINE_ID=' || p_statement_line_id);
+                END;
         END;
 
         xxemr_log(
             p_source      => 'STATEMENT_ACTION',
-            p_log_message => 'Routing to xxemr_apply_ai_match. '
+            p_log_message => 'Routing to xxemr_confirm_ai_match. '
                           || 'LINE_ID='        || p_statement_line_id
                           || ' | MATCH_GROUP=' || l_match_group_id
         );
 
-        xxemr_apply_ai_match(
-            p_match_group_id => l_match_group_id,
-            p_user           => p_user
+        xxemr_confirm_ai_match(
+            p_statement_line_id => p_statement_line_id,
+            p_user              => p_user
         );
 
         xxemr_log(
             p_source      => 'STATEMENT_ACTION',
-            p_log_message => 'BEST POSSIBLE MATCH completed successfully. '
+            p_log_message => 'BEST POSSIBLE MATCH confirmed and FBDI staged. '
                           || 'LINE_ID='        || p_statement_line_id
                           || ' | MATCH_GROUP=' || l_match_group_id
         );
