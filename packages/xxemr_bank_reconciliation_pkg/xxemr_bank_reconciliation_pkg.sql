@@ -1,4 +1,4 @@
-CREATE OR REPLACE PACKAGE XXEMR_BANK_RECONCILIATION_PKG AS
+create or replace PACKAGE XXEMR_BANK_RECONCILIATION_PKG AS
 
 -- ================================================================
 -- PACKAGE SPEC : XXEMR_BANK_RECONCILIATION_PKG
@@ -306,6 +306,61 @@ PROCEDURE xxemr_run_auto (
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
     p_commit_interval      IN  NUMBER   DEFAULT 200
+);
+
+
+-- ================================================================
+-- SECTION 6 — STATEMENT ACTION DISPATCHER
+-- ================================================================
+
+PROCEDURE xxemr_process_statement_action (
+-- ----------------------------------------------------------------
+-- PROCEDURE : xxemr_process_statement_action
+-- Purpose   : Central dispatcher triggered from the APEX UI.
+--             Routes to the correct processing procedure based on
+--             the user-selected action.
+-- Actions   :
+--   BEST POSSIBLE MATCH      -> xxemr_confirm_ai_match
+--   CREATE EXT. TRANSACTION  -> xxemr_create_me_external_transaction
+--   MANUAL RECONCILIATION    -> xxemr_process_manual_match
+-- Parameters:
+--   p_statement_line_id -- statement line to process
+--   p_action            -- action string (see above)
+--   p_candidates        -- colon-delimited tokens (MANUAL only)
+--   p_user              -- user performing the action
+-- ----------------------------------------------------------------
+    p_statement_line_id IN NUMBER,
+    p_action            IN VARCHAR2,
+    p_candidates        IN VARCHAR2 DEFAULT NULL,
+    p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
+);
+
+
+PROCEDURE xxemr_process_statement_action_bulk (
+-- ----------------------------------------------------------------
+-- PROCEDURE : xxemr_process_statement_action_bulk
+-- Purpose   : Bulk dispatcher triggered from APEX. Accepts a
+--             colon-separated token list where each token contains
+--             an action prefix + statement_line_id.
+-- Token prefixes:
+--   NA   -- No Action
+--   BPM  -- Best Possible Match
+--   CET  -- Create Ext. Transaction
+--   MR   -- Manual Reconciliation
+-- Parameters:
+--   p_line_action_tokens -- colon-delimited action+line_id tokens
+--   p_candidates         -- candidates for MR actions (optional)
+--   p_user               -- user performing the action
+--   p_success_count      -- OUT: number of lines processed OK
+--   p_error_count        -- OUT: number of lines that failed
+--   p_error_summary      -- OUT: pipe-delimited error detail
+-- ----------------------------------------------------------------
+    p_line_action_tokens IN  VARCHAR2,
+    p_candidates         IN  VARCHAR2 DEFAULT NULL,
+    p_user               IN  VARCHAR2 DEFAULT 'SYSTEM',
+    p_success_count      OUT NUMBER,
+    p_error_count        OUT NUMBER,
+    p_error_summary      OUT VARCHAR2
 );
 
 
