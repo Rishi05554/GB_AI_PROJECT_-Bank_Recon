@@ -163,8 +163,8 @@ PROCEDURE xxemr_suggest_one_to_one_match (
 --   explanation          VARCHAR2
 -- ----------------------------------------------------------------
     p_statement_line_id IN  NUMBER,
-    p_top_n             IN  NUMBER   DEFAULT 5,
-    p_date_window_days  IN  NUMBER   DEFAULT 7,
+    p_top_n             IN  NUMBER   DEFAULT 3,
+    p_date_window_days  IN  NUMBER   DEFAULT 20,
     p_amount_tolerance  IN  NUMBER   DEFAULT 0.5,
     p_result            OUT SYS_REFCURSOR
 );
@@ -189,9 +189,9 @@ PROCEDURE xxemr_run_one_to_one_batch (
 --   p_created_by         — audit user (default 'SYSTEM')
 -- ----------------------------------------------------------------
     p_bank_account_id  IN  NUMBER,
-    p_date_window_days IN  NUMBER   DEFAULT 7,
+    p_date_window_days IN  NUMBER   DEFAULT 20,
     p_amount_tolerance IN  NUMBER   DEFAULT 0.5,
-    p_top_n            IN  NUMBER   DEFAULT 5,
+    p_top_n            IN  NUMBER   DEFAULT 3,
     p_created_by       IN  VARCHAR2 DEFAULT 'SYSTEM'
 );
 
