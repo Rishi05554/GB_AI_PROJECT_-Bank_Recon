@@ -767,16 +767,18 @@ END xxemr_confirm_ai_match;
 --           Returns fusion transaction ID, HTTP status, raw response.
 -- ----------------------------------------------------------------
 PROCEDURE xxemr_create_fusion_ext_transaction (
-    p_bank_account_name  IN  VARCHAR2,
-    p_amount             IN  NUMBER,
-    p_txn_type           IN  VARCHAR2,
-    p_currency_code      IN  VARCHAR2,
-    p_transaction_date   IN  DATE,
-    p_reference_num      IN  VARCHAR2,
-    p_description        IN  VARCHAR2,
-    x_fusion_txn_id      OUT VARCHAR2,
-    x_api_status         OUT NUMBER,
-    x_api_response       OUT CLOB
+    p_bank_account_name    IN  VARCHAR2,
+    p_amount               IN  NUMBER,
+    p_txn_type             IN  VARCHAR2,
+    p_currency_code        IN  VARCHAR2,
+    p_transaction_date     IN  DATE,
+    p_reference_num        IN  VARCHAR2,
+    p_description          IN  VARCHAR2,
+    p_asset_account_combo  IN  VARCHAR2 DEFAULT NULL,
+    p_offset_account_combo IN  VARCHAR2 DEFAULT NULL,
+    x_fusion_txn_id        OUT VARCHAR2,
+    x_api_status           OUT NUMBER,
+    x_api_response         OUT CLOB
 )
 IS
     v_endpoint  VARCHAR2(500);
@@ -799,6 +801,16 @@ BEGIN
         || '"TransactionType":"' || REPLACE(NVL(p_txn_type,''), '"','\"')                             || '",'
         || '"AccountingFlag":'   || 'false'                                                           || ','
         || '"TransactionDate":"' || TO_CHAR(p_transaction_date,'YYYY-MM-DD')                          || '"'
+        || CASE WHEN p_asset_account_combo IS NOT NULL
+                THEN ',"AssetAccountCombination":"'
+                     || REPLACE(p_asset_account_combo, '"','\"') || '"'
+                ELSE ''
+           END
+        || CASE WHEN p_offset_account_combo IS NOT NULL
+                THEN ',"OffsetAccountCombination":"'
+                     || REPLACE(p_offset_account_combo, '"','\"') || '"'
+                ELSE ''
+           END
         || '}';
 
     apex_web_service.g_request_headers.DELETE;
@@ -1760,6 +1772,8 @@ IS
     v_bank_name         VARCHAR2(500)  := NULL;
     v_txn_type          VARCHAR2(100)  := NULL;
     v_creation_amount   NUMBER         := NULL;
+    v_asset_account     VARCHAR2(500)  := NULL;
+    v_offset_account    VARCHAR2(500)  := NULL;
 BEGIN
     BEGIN
         SELECT s.* INTO v_stmt
@@ -1840,17 +1854,32 @@ BEGIN
             ELSE                       v_stmt.amount
         END;
 
+    -- Fetch asset and offset account combinations from bank details
+    BEGIN
+        SELECT concatenated_segments, offset_account_combination
+          INTO v_asset_account, v_offset_account
+          FROM xxemr_bank_details
+         WHERE bank_account_id = v_stmt.bank_account_id
+           AND ROWNUM = 1;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            v_asset_account  := NULL;
+            v_offset_account := NULL;
+    END;
+
     xxemr_create_fusion_ext_transaction(
-        p_bank_account_name => v_bank_account_name,
-        p_amount            => v_creation_amount,
-        p_txn_type          => v_txn_type,
-        p_currency_code     => v_stmt.currency_code,
-        p_transaction_date  => v_stmt.statement_date,
-        p_reference_num     => v_stmt.reference_num,
-        p_description       => v_stmt.description,
-        x_fusion_txn_id     => v_fusion_ext_tx_id,
-        x_api_status        => v_api_status,
-        x_api_response      => v_api_response
+        p_bank_account_name    => v_bank_account_name,
+        p_amount               => v_creation_amount,
+        p_txn_type             => v_txn_type,
+        p_currency_code        => v_stmt.currency_code,
+        p_transaction_date     => v_stmt.statement_date,
+        p_reference_num        => v_stmt.reference_num,
+        p_description          => v_stmt.description,
+        p_asset_account_combo  => v_asset_account,
+        p_offset_account_combo => v_offset_account,
+        x_fusion_txn_id        => v_fusion_ext_tx_id,
+        x_api_status           => v_api_status,
+        x_api_response         => v_api_response
     );
 
     IF v_api_status IN (200, 201) THEN
@@ -1929,6 +1958,8 @@ IS
     v_bank_name         VARCHAR2(500)  := NULL;
     v_txn_type          VARCHAR2(100)  := NULL;
     v_creation_amount   NUMBER         := NULL;
+    v_asset_account     VARCHAR2(500)  := NULL;
+    v_offset_account    VARCHAR2(500)  := NULL;
 BEGIN
     BEGIN
         SELECT s.* INTO v_stmt
@@ -2009,17 +2040,32 @@ BEGIN
             ELSE                       v_stmt.amount
         END;
 
+    -- Fetch asset and offset account combinations from bank details
+    BEGIN
+        SELECT concatenated_segments, offset_account_combination
+          INTO v_asset_account, v_offset_account
+          FROM xxemr_bank_details
+         WHERE bank_account_id = v_stmt.bank_account_id
+           AND ROWNUM = 1;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            v_asset_account  := NULL;
+            v_offset_account := NULL;
+    END;
+
     xxemr_create_fusion_ext_transaction(
-        p_bank_account_name => v_bank_account_name,
-        p_amount            => v_creation_amount,
-        p_txn_type          => v_txn_type,
-        p_currency_code     => v_stmt.currency_code,
-        p_transaction_date  => v_stmt.statement_date,
-        p_reference_num     => v_stmt.reference_num,
-        p_description       => v_stmt.description,
-        x_fusion_txn_id     => v_fusion_ext_tx_id,
-        x_api_status        => v_api_status,
-        x_api_response      => v_api_response
+        p_bank_account_name    => v_bank_account_name,
+        p_amount               => v_creation_amount,
+        p_txn_type             => v_txn_type,
+        p_currency_code        => v_stmt.currency_code,
+        p_transaction_date     => v_stmt.statement_date,
+        p_reference_num        => v_stmt.reference_num,
+        p_description          => v_stmt.description,
+        p_asset_account_combo  => v_asset_account,
+        p_offset_account_combo => v_offset_account,
+        x_fusion_txn_id        => v_fusion_ext_tx_id,
+        x_api_status           => v_api_status,
+        x_api_response         => v_api_response
     );
 
     IF v_api_status IN (200, 201) THEN
@@ -2130,8 +2176,8 @@ PROCEDURE xxemr_suggest_one_to_one_match (
 -- Source    : Ported from standalone xxemr_recon_pkg (Doc 3).
 -- ----------------------------------------------------------------
     p_statement_line_id IN  NUMBER,
-    p_top_n             IN  NUMBER   DEFAULT 5,
-    p_date_window_days  IN  NUMBER   DEFAULT 7,
+    p_top_n             IN  NUMBER   DEFAULT 3,
+    p_date_window_days  IN  NUMBER   DEFAULT 20,
     p_amount_tolerance  IN  NUMBER   DEFAULT 0.5,
     p_result            OUT SYS_REFCURSOR
 ) IS
@@ -2273,9 +2319,9 @@ PROCEDURE xxemr_run_one_to_one_batch (
 --             xxemr_match_group_details INSERT.
 -- ----------------------------------------------------------------
     p_bank_account_id  IN  NUMBER,
-    p_date_window_days IN  NUMBER   DEFAULT 7,
+    p_date_window_days IN  NUMBER   DEFAULT 20,
     p_amount_tolerance IN  NUMBER   DEFAULT 0.5,
-    p_top_n            IN  NUMBER   DEFAULT 5,
+    p_top_n            IN  NUMBER   DEFAULT 3,
     p_created_by       IN  VARCHAR2 DEFAULT 'SYSTEM'
 ) IS
     CURSOR c_stmt_lines IS
@@ -2467,8 +2513,8 @@ PROCEDURE xxemr_suggest_line_matches (
     p_top_n                IN  NUMBER   DEFAULT 3,
     p_date_window_days     IN  NUMBER   DEFAULT 15,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
-    p_max_combo_size       IN  NUMBER   DEFAULT 3,
-    p_max_receipt_pool     IN  NUMBER   DEFAULT 60,
+    p_max_combo_size       IN  NUMBER   DEFAULT 5,
+    p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
     p_include_external_txn IN  VARCHAR2 DEFAULT 'Y',
     p_allow_one_to_many    IN  VARCHAR2 DEFAULT 'Y',
     p_result               OUT SYS_REFCURSOR
@@ -2703,9 +2749,9 @@ PROCEDURE xxemr_run_batch (
     p_top_n                IN  NUMBER   DEFAULT 3,
     p_date_window_days     IN  NUMBER   DEFAULT 15,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
-    p_max_combo_size       IN  NUMBER   DEFAULT 3,
-    p_max_receipt_pool     IN  NUMBER   DEFAULT 60,
-    p_commit_interval      IN  NUMBER   DEFAULT 500
+    p_max_combo_size       IN  NUMBER   DEFAULT 5,
+    p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
+    p_commit_interval      IN  NUMBER   DEFAULT 200
 ) IS
     CURSOR c_stmt IS
         SELECT s.statement_line_id,
@@ -2936,9 +2982,9 @@ PROCEDURE xxemr_run_auto (
     p_top_n                IN  NUMBER   DEFAULT 3,
     p_date_window_days     IN  NUMBER   DEFAULT 15,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
-    p_max_combo_size       IN  NUMBER   DEFAULT 3,
-    p_max_receipt_pool     IN  NUMBER   DEFAULT 60,
-    p_commit_interval      IN  NUMBER   DEFAULT 500
+    p_max_combo_size       IN  NUMBER   DEFAULT 5,
+    p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
+    p_commit_interval      IN  NUMBER   DEFAULT 200
 ) IS
     -- Rolling 3-month window; NOT EXISTS ensures incremental only
     CURSOR c_stmt IS
