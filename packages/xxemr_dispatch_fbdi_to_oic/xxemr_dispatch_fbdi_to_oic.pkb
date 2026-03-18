@@ -1,4 +1,4 @@
-CREATE OR REPLACE PROCEDURE xxemr_dispatch_fbdi_to_oic (
+create or replace PROCEDURE xxemr_dispatch_fbdi_to_oic (
     p_batch_size   IN NUMBER DEFAULT 100,
     p_max_attempts IN NUMBER DEFAULT 2
 ) AS
@@ -66,109 +66,110 @@ CREATE OR REPLACE PROCEDURE xxemr_dispatch_fbdi_to_oic (
         l_first_group := TRUE;
     END reset_batch;
 
-    PROCEDURE flush_batch IS
-        l_envelope         CLOB;
-        l_errored_in_batch NUMBER := 0;
+PROCEDURE flush_batch IS
+    l_envelope         CLOB;
+    l_errored_in_batch NUMBER := 0;
+BEGIN
+    IF l_batch_count = 0 THEN
+        RETURN;
+    END IF;
+
+    DBMS_LOB.CREATETEMPORARY(l_envelope, TRUE);
+    DBMS_LOB.APPEND(l_envelope, TO_CLOB('{"reconciliationLines":['));
+    DBMS_LOB.APPEND(l_envelope, l_payload);
+    DBMS_LOB.APPEND(l_envelope, TO_CLOB(']}'));
+
+    DBMS_OUTPUT.PUT_LINE('  Flushing: '
+        || l_batch_count || ' groups | '
+        || l_id_count    || ' lines');
+
     BEGIN
-        IF l_batch_count = 0 THEN
-            RETURN;
-        END IF;
+        apex_web_service.g_request_headers.DELETE;
+        apex_web_service.g_request_headers(1).name  := 'Content-Type';
+        apex_web_service.g_request_headers(1).value := 'application/json';
 
-        DBMS_LOB.CREATETEMPORARY(l_envelope, TRUE);
-        DBMS_LOB.APPEND(l_envelope, TO_CLOB('{"reconciliationLines":['));
-        DBMS_LOB.APPEND(l_envelope, l_payload);
-        DBMS_LOB.APPEND(l_envelope, TO_CLOB(']}'));
+        l_api_response := SUBSTR(
+            apex_web_service.make_rest_request(
+                p_url         => v_endpoint,
+                p_http_method => 'POST',
+                p_username    => v_username,
+                p_password    => v_password,
+                p_body        => l_envelope
+            ), 1, 4000);
+        l_api_status := apex_web_service.g_status_code;
+    EXCEPTION
+        WHEN OTHERS THEN
+            l_api_status   := -1;
+            l_api_response := SUBSTR('REST exception: ' || SQLERRM, 1, 4000);
+    END;
 
-        DBMS_OUTPUT.PUT_LINE('  Flushing: '
-            || l_batch_count || ' groups | '
-            || l_id_count    || ' lines');
+    DBMS_OUTPUT.PUT_LINE('  HTTP ' || NVL(TO_CHAR(l_api_status), 'NULL'));
 
-        BEGIN
-            -- Set Content-Type so OIC accepts the JSON payload
-            apex_web_service.g_request_headers.DELETE;
-            apex_web_service.g_request_headers(1).name  := 'Content-Type';
-            apex_web_service.g_request_headers(1).value := 'application/json';
+    -- ================================================================
+    -- FIX: Accept 202 (OIC async accepted) in addition to 200/201
+    -- ================================================================
+    IF l_api_status IN (200, 201, 202) THEN
 
-            l_api_response := SUBSTR(
-                apex_web_service.make_rest_request(
-                    p_url         => v_endpoint,
-                    p_http_method => 'POST',
-                    p_username    => v_username,
-                    p_password    => v_password,
-                    p_body        => l_envelope
-                ), 1, 4000);
-            l_api_status := apex_web_service.g_status_code;
-        EXCEPTION
-            WHEN OTHERS THEN
-                l_api_status   := -1;
-                l_api_response := SUBSTR('REST exception: ' || SQLERRM, 1, 4000);
-        END;
+        FORALL i IN 1 .. l_id_count
+            UPDATE xxemr_recon_fbdi_lines
+               SET send_status      = 'SENT',
+                   send_attempts    = send_attempts + 1,
+                   sent_date        = SYSTIMESTAMP,
+                   oic_response     = l_api_response,
+                   last_error       = NULL,
+                   last_updated_by  = 'OIC_DISPATCHER',
+                   last_update_date = SYSTIMESTAMP
+             WHERE fbdi_line_id     = l_id_list(i);
 
-        DBMS_OUTPUT.PUT_LINE('  HTTP ' || NVL(TO_CHAR(l_api_status), 'NULL'));
+        COMMIT;
+        l_total_sent := l_total_sent + l_batch_count;
+        DBMS_OUTPUT.PUT_LINE('  Accepted by OIC. HTTP=' || l_api_status);
 
-        IF l_api_status IN (200, 201) THEN
+    ELSE
 
-            FORALL i IN 1 .. l_id_count
-                UPDATE xxemr_recon_fbdi_lines
-                   SET send_status      = 'SENT',
-                       send_attempts    = send_attempts + 1,
-                       sent_date        = SYSTIMESTAMP,
-                       oic_response     = l_api_response,
-                       last_error       = NULL,
-                       last_updated_by  = 'OIC_DISPATCHER',
-                       last_update_date = SYSTIMESTAMP
-                 WHERE fbdi_line_id     = l_id_list(i);
+        FORALL i IN 1 .. l_id_count
+            UPDATE xxemr_recon_fbdi_lines
+               SET send_attempts    = send_attempts + 1,
+                   last_error       = 'HTTP ' || l_api_status || ' | ' || l_api_response,
+                   last_updated_by  = 'OIC_DISPATCHER',
+                   last_update_date = SYSTIMESTAMP
+             WHERE fbdi_line_id     = l_id_list(i);
 
-            COMMIT;
-            l_total_sent := l_total_sent + l_batch_count;
-            DBMS_OUTPUT.PUT_LINE('  Accepted by OIC.');
+        FORALL i IN 1 .. l_id_count
+            UPDATE xxemr_recon_fbdi_lines
+               SET send_status = CASE
+                                     WHEN send_attempts >= p_max_attempts
+                                     THEN 'ERROR'
+                                     ELSE 'FAILED'
+                                 END
+             WHERE fbdi_line_id = l_id_list(i);
 
-        ELSE
+        l_errored_in_batch := 0;
+        FOR k IN 1 .. l_id_count LOOP
+            DECLARE
+                l_chk NUMBER;
+            BEGIN
+                SELECT COUNT(*) INTO l_chk
+                  FROM xxemr_recon_fbdi_lines
+                 WHERE fbdi_line_id = l_id_list(k)
+                   AND source_code  = 'BS'
+                   AND send_status  = 'ERROR';
+                l_errored_in_batch := l_errored_in_batch + l_chk;
+            END;
+        END LOOP;
 
-            FORALL i IN 1 .. l_id_count
-                UPDATE xxemr_recon_fbdi_lines
-                   SET send_attempts    = send_attempts + 1,
-                       last_error       = l_api_response,
-                       last_updated_by  = 'OIC_DISPATCHER',
-                       last_update_date = SYSTIMESTAMP
-                 WHERE fbdi_line_id     = l_id_list(i);
+        COMMIT;
+        l_total_failed  := l_total_failed  + l_batch_count;
+        l_total_errored := l_total_errored + l_errored_in_batch;
+        DBMS_OUTPUT.PUT_LINE('  Failed. HTTP='
+            || NVL(TO_CHAR(l_api_status), 'NULL')
+            || ' | Permanently errored: ' || l_errored_in_batch);
 
-            FORALL i IN 1 .. l_id_count
-                UPDATE xxemr_recon_fbdi_lines
-                   SET send_status = CASE
-                                         WHEN send_attempts >= p_max_attempts
-                                         THEN 'ERROR'
-                                         ELSE 'FAILED'
-                                     END
-                 WHERE fbdi_line_id = l_id_list(i);
+    END IF;
 
-            l_errored_in_batch := 0;
-            FOR k IN 1 .. l_id_count LOOP
-                DECLARE
-                    l_chk NUMBER;
-                BEGIN
-                    SELECT COUNT(*) INTO l_chk
-                      FROM xxemr_recon_fbdi_lines
-                     WHERE fbdi_line_id = l_id_list(k)
-                       AND source_code  = 'BS'
-                       AND send_status  = 'ERROR';
-                    l_errored_in_batch := l_errored_in_batch + l_chk;
-                END;
-            END LOOP;
+    DBMS_LOB.FREETEMPORARY(l_envelope);
 
-            COMMIT;
-            l_total_failed  := l_total_failed  + l_batch_count;
-            l_total_errored := l_total_errored + l_errored_in_batch;
-            DBMS_OUTPUT.PUT_LINE('  Failed. HTTP='
-                || NVL(TO_CHAR(l_api_status), 'NULL')
-                || ' | Permanently errored: ' || l_errored_in_batch);
-
-        END IF;
-
-        DBMS_LOB.FREETEMPORARY(l_envelope);
-
-    END flush_batch;
-
+END flush_batch;
 BEGIN
     DBMS_OUTPUT.PUT_LINE('================================================');
     DBMS_OUTPUT.PUT_LINE('xxemr_dispatch_fbdi_to_oic  START : '
@@ -298,3 +299,4 @@ EXCEPTION
         RAISE;
 
 END xxemr_dispatch_fbdi_to_oic;
+/
