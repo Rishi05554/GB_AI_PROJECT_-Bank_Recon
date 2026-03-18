@@ -1,4 +1,4 @@
-CREATE OR REPLACE PACKAGE BODY XXEMR_BANK_RECONCILIATION_PKG AS
+create or replace PACKAGE BODY XXEMR_BANK_RECONCILIATION_PKG AS
 
 -- ================================================================
 -- PACKAGE BODY : XXEMR_BANK_RECONCILIATION_PKG
@@ -2511,7 +2511,7 @@ PROCEDURE xxemr_suggest_line_matches (
 -- ----------------------------------------------------------------
     p_statement_line_id    IN  NUMBER,
     p_top_n                IN  NUMBER   DEFAULT 3,
-    p_date_window_days     IN  NUMBER   DEFAULT 15,
+    p_date_window_days     IN  NUMBER   DEFAULT 20,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
@@ -2747,7 +2747,7 @@ PROCEDURE xxemr_run_batch (
     p_stmt_from_date       IN  DATE,
     p_stmt_to_date         IN  DATE,
     p_top_n                IN  NUMBER   DEFAULT 3,
-    p_date_window_days     IN  NUMBER   DEFAULT 15,
+    p_date_window_days     IN  NUMBER   DEFAULT 20,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
@@ -2980,7 +2980,7 @@ PROCEDURE xxemr_run_auto (
 -- ----------------------------------------------------------------
     p_run_id               OUT NUMBER,
     p_top_n                IN  NUMBER   DEFAULT 3,
-    p_date_window_days     IN  NUMBER   DEFAULT 15,
+    p_date_window_days     IN  NUMBER   DEFAULT 20,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
@@ -3145,7 +3145,7 @@ BEGIN
                     created_date
                 ) VALUES (
                     xxemr_match_groups_seq.nextval, r.statement_line_id, 0,
-                    l_stmt_amount, 0, 'ONE_TO_MANY', 0,
+                    l_stmt_amount, 0, 'NO_MATCH_FOUND', 0,
                     'NEVER_PROCESSED', NULL, SYSDATE
                 );
             END IF;
