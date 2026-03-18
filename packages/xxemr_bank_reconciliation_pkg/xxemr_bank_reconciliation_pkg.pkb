@@ -2584,7 +2584,7 @@ BEGIN
                                             AND l_stmt_date + p_date_window_days
                    AND NVL(r.match_flag,  'N') <> 'Y'
                    AND NVL(r.recon_flag,  'N') <> 'Y'
-                   AND r.status NOT IN ('REVERSED')
+                   AND r.status NOT IN ('REV')
               )
              WHERE rn <= p_max_receipt_pool
         ),
