@@ -2165,20 +2165,10 @@ END xxemr_create_me_external_transaction;
 -- ================================================================
 
 PROCEDURE xxemr_suggest_one_to_one_match (
--- ----------------------------------------------------------------
--- PROCEDURE : xxemr_suggest_one_to_one_match
--- Purpose   : Scores and ranks AR receipt candidates for a single
---             statement line using weighted scoring:
---               Amount similarity    60%
---               Date proximity       25%
---               Reference similarity 15%
---             Returns top-N candidates via ref cursor.
--- Source    : Ported from standalone xxemr_recon_pkg (Doc 3).
--- ----------------------------------------------------------------
     p_statement_line_id IN  NUMBER,
     p_top_n             IN  NUMBER   DEFAULT 3,
-    p_date_window_days  IN  NUMBER   DEFAULT 20,
-    p_amount_tolerance  IN  NUMBER   DEFAULT 0.5,
+    p_date_window_days  IN  NUMBER   DEFAULT 100,  -- updated
+    p_amount_tolerance  IN  NUMBER   DEFAULT 1,    -- absolute ±1 AED
     p_result            OUT SYS_REFCURSOR
 ) IS
     l_stmt_amount     xxemr_bank_statement_lines.amount%TYPE;
@@ -2220,41 +2210,49 @@ BEGIN
                    ) AS rcpt_ref_norm
               FROM xxemr_ar_cash_receipts r
              WHERE r.remittance_bank_account_id = l_bank_account_id
-               AND NVL(r.currency_code, 'NONE')  = NVL(l_currency_code, 'NONE')
+               AND NVL(r.currency_code, 'NONE') = NVL(l_currency_code, 'NONE')
                AND TRUNC(r.gl_date)
                        BETWEEN l_stmt_date - p_date_window_days
                            AND l_stmt_date + p_date_window_days
                AND NVL(r.match_flag,  'N') <> 'Y'
                AND NVL(r.recon_flag,  'N') <> 'Y'
                AND r.status NOT IN ('REV')
-               AND ABS(l_stmt_amount - r.amount)
-                       <= ABS(l_stmt_amount * p_amount_tolerance / 100)
+               AND ABS(l_stmt_amount - r.amount) <= p_amount_tolerance
         ),
         ar_candidates AS (
             SELECT
-                'AR_RECEIPT'                        AS candidate_source,
-                cash_receipt_id                     AS candidate_key,
-                amount                              AS candidate_amount,
-                ABS(l_stmt_amount - amount)         AS amount_diff,
-                ABS(TRUNC(gl_date) - l_stmt_date)   AS date_diff_days,
+                'AR_RECEIPT'                      AS candidate_source,
+                cash_receipt_id                   AS candidate_key,
+                amount                            AS candidate_amount,
+                ABS(l_stmt_amount - amount)       AS amount_diff,
+                ABS(TRUNC(gl_date) - l_stmt_date) AS date_diff_days,
+                -- --------------------------------------------------------
+                -- Reference scoring:
+                --   Exact match (normalized strings equal) → 100
+                --   Partial / fuzzy match via edit distance → 0–60
+                --   No reference on either side             → 0
+                -- --------------------------------------------------------
                 CASE
-                    WHEN l_stmt_ref_norm IS NULL THEN 0
-                    WHEN rcpt_ref_norm   IS NULL THEN 0
-                    WHEN rcpt_ref_norm   = ''    THEN 0
-                    ELSE UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
-                             l_stmt_ref_norm, rcpt_ref_norm)
-                END                                 AS reference_score,
+                    WHEN l_stmt_ref_norm IS NULL OR l_stmt_ref_norm = '' THEN 0
+                    WHEN rcpt_ref_norm   IS NULL OR rcpt_ref_norm   = '' THEN 0
+                    WHEN l_stmt_ref_norm = rcpt_ref_norm
+                        THEN 100   -- exact match → full score
+                    WHEN INSTR(l_stmt_ref_norm, rcpt_ref_norm) > 0
+                      OR INSTR(rcpt_ref_norm, l_stmt_ref_norm) > 0
+                        THEN 60    -- one contains the other → high partial
+                    ELSE
+                        -- fuzzy similarity but capped at 40 so it never
+                        -- competes with exact/contains matches
+                        LEAST(40, UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
+                                      l_stmt_ref_norm, rcpt_ref_norm))
+                END                               AS reference_score,
                 CASE
-                    WHEN l_stmt_ref_norm IS NULL THEN 'N'
-                    WHEN rcpt_ref_norm   IS NULL THEN 'N'
-                    WHEN rcpt_ref_norm   = ''    THEN 'N'
-                    WHEN REGEXP_LIKE(
-                             l_stmt_ref_norm,
-                             '(^|[^0-9a-z])' || rcpt_ref_norm || '([^0-9a-z]|$)'
-                         )                     THEN 'Y'
+                    WHEN l_stmt_ref_norm IS NULL OR l_stmt_ref_norm = '' THEN 'N'
+                    WHEN rcpt_ref_norm   IS NULL OR rcpt_ref_norm   = '' THEN 'N'
+                    WHEN l_stmt_ref_norm = rcpt_ref_norm                 THEN 'Y'
                     ELSE 'N'
-                END                                 AS desc_match_flag,
-                'AR Receipt one-to-one'             AS explanation
+                END                               AS desc_match_flag,
+                'AR Receipt one-to-one'           AS explanation
             FROM ar_raw
         ),
         ar_scored AS (
@@ -2268,15 +2266,18 @@ BEGIN
                 desc_match_flag,
                 explanation,
                 ROUND(
-                    (100 - LEAST(100,
-                        amount_diff / GREATEST(ABS(l_stmt_amount), 1) * 100
-                    )) * 0.60
+                    -- Reference: 50% weight (most important)
+                    (reference_score / 100) * 50
                     +
-                    (100 - LEAST(100,
-                        date_diff_days * 100 / GREATEST(p_date_window_days, 1)
-                    )) * 0.25
+                    -- Amount: 30% weight
+                    -- Perfect=30 when diff=0, zero when diff=tolerance
+                    (1 - LEAST(1, amount_diff
+                                  / GREATEST(p_amount_tolerance, 0.01))) * 30
                     +
-                    LEAST(100, reference_score) * 0.15,
+                    -- Date: 20% weight
+                    -- Perfect=20 when same day, zero at window edge
+                    (1 - LEAST(1, date_diff_days
+                                  / GREATEST(p_date_window_days, 1))) * 20,
                     2
                 ) AS final_score
             FROM ar_candidates
@@ -2286,9 +2287,9 @@ BEGIN
             SELECT
                 ROW_NUMBER() OVER (
                     ORDER BY final_score    DESC,
-                             amount_diff,
-                             date_diff_days,
-                             reference_score DESC
+                             reference_score DESC,
+                             amount_diff     ASC,
+                             date_diff_days  ASC
                 )                           AS candidate_rank,
                 candidate_source,
                 candidate_key,
@@ -2306,7 +2307,6 @@ BEGIN
 
 END xxemr_suggest_one_to_one_match;
 
-
 PROCEDURE xxemr_run_one_to_one_batch (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_run_one_to_one_batch
@@ -2319,8 +2319,8 @@ PROCEDURE xxemr_run_one_to_one_batch (
 --             xxemr_match_group_details INSERT.
 -- ----------------------------------------------------------------
     p_bank_account_id  IN  NUMBER,
-    p_date_window_days IN  NUMBER   DEFAULT 20,
-    p_amount_tolerance IN  NUMBER   DEFAULT 0.5,
+    p_date_window_days IN  NUMBER   DEFAULT 100,
+    p_amount_tolerance IN  NUMBER   DEFAULT 1,
     p_top_n            IN  NUMBER   DEFAULT 3,
     p_created_by       IN  VARCHAR2 DEFAULT 'SYSTEM'
 ) IS
@@ -2496,23 +2496,10 @@ END xxemr_run_one_to_one_batch;
 -- ================================================================
 
 PROCEDURE xxemr_suggest_line_matches (
--- ----------------------------------------------------------------
--- PROCEDURE : xxemr_suggest_line_matches
--- Purpose   : Scores and ranks AR receipt candidates (including
---             multi-receipt combinations) and optionally external
---             transactions for a single statement line.
---             Recursive CTE builds all combos up to
---             min(p_max_combo_size, 5) receipts (hard cap).
---             Returns top-N candidates via ref cursor.
--- Source    : Ported from standalone xxemr_bank_recon_pkg (Doc 4).
---             Fix: NO_DATA_FOUND guard added on statement line
---             lookup — returns empty cursor rather than propagating
---             the exception to the calling batch loop.
--- ----------------------------------------------------------------
     p_statement_line_id    IN  NUMBER,
     p_top_n                IN  NUMBER   DEFAULT 3,
-    p_date_window_days     IN  NUMBER   DEFAULT 20,
-    p_amount_tolerance     IN  NUMBER   DEFAULT 0,
+    p_date_window_days     IN  NUMBER   DEFAULT 100,  -- updated
+    p_amount_tolerance     IN  NUMBER   DEFAULT 0,    -- absolute ±1 AED
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
     p_include_external_txn IN  VARCHAR2 DEFAULT 'Y',
@@ -2524,8 +2511,6 @@ PROCEDURE xxemr_suggest_line_matches (
     l_bank_account_id xxemr_bank_statement_lines.bank_account_id%TYPE;
     l_stmt_ref_norm   VARCHAR2(4000);
 BEGIN
-    -- NO_DATA_FOUND guard: line may be already REC or not exist.
-    -- Return empty cursor so caller loop moves on safely.
     BEGIN
         SELECT s.amount,
                TRUNC(s.statement_date),
@@ -2550,52 +2535,64 @@ BEGIN
               FROM (
                 SELECT r.cash_receipt_id,
                        r.amount,
-                       TRUNC(r.gl_date)                                          receipt_date,
+                       TRUNC(r.gl_date)                    receipt_date,
                        r.receipt_number,
-                       ABS(l_stmt_amount - r.amount)                             amount_diff,
-                       ABS(TRUNC(r.gl_date) - l_stmt_date)                      date_diff,
+                       ABS(l_stmt_amount - r.amount)       amount_diff,
+                       ABS(TRUNC(r.gl_date) - l_stmt_date) date_diff,
+                       -- -----------------------------------------------
+                       -- Reference scoring (same logic as one-to-one)
+                       -- -----------------------------------------------
                        CASE
-                           WHEN l_stmt_ref_norm IS NULL THEN 0
+                           WHEN l_stmt_ref_norm IS NULL OR l_stmt_ref_norm = '' THEN 0
                            WHEN REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
-                                               '[^a-z0-9]','') IS NULL THEN 0
-                           ELSE UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
-                                    l_stmt_ref_norm,
-                                    REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
-                                                   '[^a-z0-9]',''))
-                       END                                                       ref_score,
+                                               '[^a-z0-9]','') IS NULL         THEN 0
+                           WHEN REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
+                                               '[^a-z0-9]','') = ''            THEN 0
+                           WHEN l_stmt_ref_norm =
+                                REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
+                                               '[^a-z0-9]','')
+                               THEN 100   -- exact
+                           WHEN INSTR(l_stmt_ref_norm,
+                                      REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
+                                                     '[^a-z0-9]','')) > 0
+                             OR INSTR(REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
+                                                     '[^a-z0-9]',''),
+                                      l_stmt_ref_norm) > 0
+                               THEN 60   -- contains
+                           ELSE
+                               LEAST(40, UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
+                                   l_stmt_ref_norm,
+                                   REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
+                                                  '[^a-z0-9]','')))
+                       END                                 ref_score,
                        ROW_NUMBER() OVER (
                            ORDER BY
+                               -- Pool ordered by: exact ref first, then amount diff
+                               CASE
+                                   WHEN l_stmt_ref_norm IS NULL OR l_stmt_ref_norm = '' THEN 2
+                                   WHEN l_stmt_ref_norm =
+                                        REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
+                                                       '[^a-z0-9]','') THEN 0
+                                   ELSE 1
+                               END,
                                ABS(l_stmt_amount - r.amount),
                                ABS(TRUNC(r.gl_date) - l_stmt_date),
-                               CASE
-                                   WHEN l_stmt_ref_norm IS NULL THEN 0
-                                   WHEN REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
-                                                       '[^a-z0-9]','') IS NULL THEN 0
-                                   ELSE UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
-                                            l_stmt_ref_norm,
-                                            REGEXP_REPLACE(LOWER(NVL(r.receipt_number,'')),
-                                                           '[^a-z0-9]',''))
-                               END DESC,
                                r.cash_receipt_id
-                       )                                                         rn
+                       )                                   rn
                   FROM xxemr_ar_cash_receipts r
                  WHERE r.remittance_bank_account_id = l_bank_account_id
                    AND TRUNC(r.gl_date) BETWEEN l_stmt_date - p_date_window_days
                                             AND l_stmt_date + p_date_window_days
                    AND NVL(r.match_flag,  'N') <> 'Y'
                    AND NVL(r.recon_flag,  'N') <> 'Y'
-                   AND r.status NOT IN ('REV')
+                   AND r.status NOT IN ('REV')             -- FIXED
+                   AND ABS(l_stmt_amount - r.amount) <= p_amount_tolerance
               )
              WHERE rn <= p_max_receipt_pool
         ),
-        -- Recursive combination builder, hard-capped at 5
         combos (last_rn, combo_size, ids, total_amount, max_date_diff, avg_ref_score) AS (
-            SELECT rp.rn,
-                   1,
-                   TO_CHAR(rp.cash_receipt_id),
-                   rp.amount,
-                   rp.date_diff,
-                   rp.ref_score
+            SELECT rp.rn, 1, TO_CHAR(rp.cash_receipt_id),
+                   rp.amount, rp.date_diff, rp.ref_score
               FROM receipt_pool rp
             UNION ALL
             SELECT rp.rn,
@@ -2611,49 +2608,58 @@ BEGIN
                                       THEN LEAST(p_max_combo_size, 5)
                                       ELSE 1
                                   END
-               AND c.total_amount + rp.amount <= l_stmt_amount  -- never over-sum
+               AND c.total_amount + rp.amount <= l_stmt_amount + p_amount_tolerance
         ),
         receipt_combo_candidates AS (
-            SELECT 'RECEIPT_COMBO'                                              AS candidate_source,
-                   ids                                                          AS candidate_key,
-                   total_amount                                                 AS candidate_amount,
-                   ABS(l_stmt_amount - total_amount)                           AS amount_diff,
-                   max_date_diff                                                AS max_date_diff_days,
-                   ROUND(avg_ref_score, 2)                                      AS reference_score,
+            SELECT 'RECEIPT_COMBO'                        AS candidate_source,
+                   ids                                    AS candidate_key,
+                   total_amount                           AS candidate_amount,
+                   ABS(l_stmt_amount - total_amount)      AS amount_diff,
+                   max_date_diff                          AS max_date_diff_days,
+                   ROUND(avg_ref_score, 2)                AS reference_score,
                    ROUND(
-                       (100 - LEAST(100, ABS(l_stmt_amount - total_amount)
-                                        / GREATEST(ABS(l_stmt_amount), 1) * 100)) * 0.60 +
-                       (100 - LEAST(100, max_date_diff * 100
-                                        / GREATEST(p_date_window_days, 1)))    * 0.25 +
-                       LEAST(100, avg_ref_score)                               * 0.15 -
-                       (combo_size - 1) * 2,
+                       -- Reference: 50%
+                       (avg_ref_score / 100) * 50
+                       +
+                       -- Amount: 30%
+                       (1 - LEAST(1, ABS(l_stmt_amount - total_amount)
+                                     / GREATEST(p_amount_tolerance, 0.01))) * 30
+                       +
+                       -- Date: 20%
+                       (1 - LEAST(1, max_date_diff
+                                     / GREATEST(p_date_window_days, 1))) * 20
+                       -- Combo penalty: -2 per extra receipt
+                       - (combo_size - 1) * 2,
                        2
-                   )                                                            AS final_score,
-                   'Combo size=' || combo_size || ', receipts=' || ids         AS explanation,
+                   )                                      AS final_score,
+                   'Combo size=' || combo_size
+                       || ', receipts=' || ids            AS explanation,
                    combo_size
               FROM combos
              WHERE ABS(l_stmt_amount - total_amount) <= p_amount_tolerance
                AND (p_allow_one_to_many = 'Y' OR combo_size = 1)
         ),
-        -- Special case: many same-amount receipts summing to statement
         receipt_group_candidates AS (
-            SELECT 'RECEIPT_GROUP'                                              AS candidate_source,
+            SELECT 'RECEIPT_GROUP'                        AS candidate_source,
                    LISTAGG(cash_receipt_id, ',')
-                       WITHIN GROUP (ORDER BY cash_receipt_id)                 AS candidate_key,
-                   SUM(amount)                                                  AS candidate_amount,
-                   ABS(l_stmt_amount - SUM(amount))                            AS amount_diff,
-                   MAX(date_diff)                                               AS max_date_diff_days,
-                   ROUND(AVG(ref_score), 2)                                    AS reference_score,
+                       WITHIN GROUP (ORDER BY cash_receipt_id) AS candidate_key,
+                   SUM(amount)                            AS candidate_amount,
+                   ABS(l_stmt_amount - SUM(amount))       AS amount_diff,
+                   MAX(date_diff)                         AS max_date_diff_days,
+                   ROUND(AVG(ref_score), 2)               AS reference_score,
                    ROUND(
-                       (100 - LEAST(100, ABS(l_stmt_amount - SUM(amount))
-                                        / GREATEST(ABS(l_stmt_amount), 1) * 100)) * 0.65 +
-                       (100 - LEAST(100, MAX(date_diff) * 100
-                                        / GREATEST(p_date_window_days, 1)))    * 0.20 +
-                       LEAST(100, AVG(ref_score))                              * 0.15,
+                       (AVG(ref_score) / 100) * 50
+                       +
+                       (1 - LEAST(1, ABS(l_stmt_amount - SUM(amount))
+                                     / GREATEST(p_amount_tolerance, 0.01))) * 30
+                       +
+                       (1 - LEAST(1, MAX(date_diff)
+                                     / GREATEST(p_date_window_days, 1))) * 20,
                        2
-                   )                                                            AS final_score,
-                   'Same-amount grouped receipts, cnt=' || COUNT(*)            AS explanation,
-                   COUNT(*)                                                     AS combo_size
+                   )                                      AS final_score,
+                   'Same-amount grouped receipts, cnt='
+                       || COUNT(*)                        AS explanation,
+                   COUNT(*)                               AS combo_size
               FROM receipt_pool
              WHERE p_allow_one_to_many = 'Y'
              GROUP BY amount
@@ -2661,47 +2667,74 @@ BEGIN
                AND COUNT(*) >= 2
         ),
         external_candidates AS (
-            SELECT 'EXTERNAL_TXN'                                              AS candidate_source,
-                   TO_CHAR(e.ext_txn_id)                                       AS candidate_key,
-                   e.amount                                                     AS candidate_amount,
-                   ABS(l_stmt_amount - e.amount)                               AS amount_diff,
-                   ABS(TRUNC(e.transaction_date) - l_stmt_date)                AS max_date_diff_days,
+            SELECT 'EXTERNAL_TXN'                         AS candidate_source,
+                   TO_CHAR(e.ext_txn_id)                  AS candidate_key,
+                   e.amount                               AS candidate_amount,
+                   ABS(l_stmt_amount - e.amount)          AS amount_diff,
+                   ABS(TRUNC(e.transaction_date)
+                       - l_stmt_date)                     AS max_date_diff_days,
                    CASE
-                       WHEN l_stmt_ref_norm IS NULL THEN 0
+                       WHEN l_stmt_ref_norm IS NULL
+                         OR l_stmt_ref_norm = ''          THEN 0
                        WHEN REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
                                            '[^a-z0-9]','') IS NULL THEN 0
-                       ELSE UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
-                                l_stmt_ref_norm,
-                                REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
-                                               '[^a-z0-9]',''))
-                   END                                                         AS reference_score,
+                       WHEN l_stmt_ref_norm =
+                            REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
+                                           '[^a-z0-9]','')
+                           THEN 100
+                       WHEN INSTR(l_stmt_ref_norm,
+                                  REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
+                                                 '[^a-z0-9]','')) > 0
+                         OR INSTR(REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
+                                                 '[^a-z0-9]',''),
+                                  l_stmt_ref_norm) > 0
+                           THEN 60
+                       ELSE
+                           LEAST(40, UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
+                               l_stmt_ref_norm,
+                               REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
+                                              '[^a-z0-9]','')))
+                   END                                    AS reference_score,
                    ROUND(
-                       (100 - LEAST(100, ABS(l_stmt_amount - e.amount)
-                                        / GREATEST(ABS(l_stmt_amount), 1) * 100)) * 0.65 +
-                       (100 - LEAST(100, ABS(TRUNC(e.transaction_date) - l_stmt_date) * 100
-                                        / GREATEST(p_date_window_days, 1)))    * 0.20 +
-                       LEAST(100,
-                           CASE
-                               WHEN l_stmt_ref_norm IS NULL THEN 0
-                               WHEN REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
-                                                   '[^a-z0-9]','') IS NULL THEN 0
-                               ELSE UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
-                                        l_stmt_ref_norm,
-                                        REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
-                                                       '[^a-z0-9]',''))
-                           END
-                       )                                                       * 0.15,
+                       (CASE
+                           WHEN l_stmt_ref_norm IS NULL
+                             OR l_stmt_ref_norm = ''      THEN 0
+                           WHEN REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
+                                               '[^a-z0-9]','') IS NULL THEN 0
+                           WHEN l_stmt_ref_norm =
+                                REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
+                                               '[^a-z0-9]','')
+                               THEN 100
+                           WHEN INSTR(l_stmt_ref_norm,
+                                      REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
+                                                     '[^a-z0-9]','')) > 0
+                             OR INSTR(REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
+                                                     '[^a-z0-9]',''),
+                                      l_stmt_ref_norm) > 0
+                               THEN 60
+                           ELSE
+                               LEAST(40, UTL_MATCH.EDIT_DISTANCE_SIMILARITY(
+                                   l_stmt_ref_norm,
+                                   REGEXP_REPLACE(LOWER(NVL(e.reference_num,'')),
+                                                  '[^a-z0-9]','')))
+                        END / 100) * 50
+                       +
+                       (1 - LEAST(1, ABS(l_stmt_amount - e.amount)
+                                     / GREATEST(p_amount_tolerance, 0.01))) * 30
+                       +
+                       (1 - LEAST(1, ABS(TRUNC(e.transaction_date) - l_stmt_date)
+                                     / GREATEST(p_date_window_days, 1))) * 20,
                        2
-                   )                                                           AS final_score,
-                   'External transaction single match'                         AS explanation,
-                   1                                                           AS combo_size
+                   )                                      AS final_score,
+                   'External transaction single match'    AS explanation,
+                   1                                      AS combo_size
               FROM xxemr_external_transactions e
-             WHERE p_include_external_txn         = 'Y'
-               AND e.bank_account_id              = l_bank_account_id
+             WHERE p_include_external_txn        = 'Y'
+               AND e.bank_account_id             = l_bank_account_id
                AND TRUNC(e.transaction_date) BETWEEN l_stmt_date - p_date_window_days
                                                  AND l_stmt_date + p_date_window_days
                AND NVL(e.recon_status, 'UNR') NOT IN ('REC')
-               AND ABS(l_stmt_amount - e.amount)  <= p_amount_tolerance
+               AND ABS(l_stmt_amount - e.amount) <= p_amount_tolerance
         ),
         all_candidates AS (
             SELECT * FROM receipt_combo_candidates
@@ -2713,7 +2746,10 @@ BEGIN
         SELECT *
           FROM (
             SELECT ROW_NUMBER() OVER (
-                       ORDER BY final_score DESC, amount_diff, max_date_diff_days
+                       ORDER BY final_score      DESC,
+                                reference_score  DESC,
+                                amount_diff      ASC,
+                                max_date_diff_days ASC
                    )               AS candidate_rank,
                    candidate_source,
                    candidate_key,
@@ -2747,7 +2783,7 @@ PROCEDURE xxemr_run_batch (
     p_stmt_from_date       IN  DATE,
     p_stmt_to_date         IN  DATE,
     p_top_n                IN  NUMBER   DEFAULT 3,
-    p_date_window_days     IN  NUMBER   DEFAULT 20,
+    p_date_window_days     IN  NUMBER   DEFAULT 100,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
@@ -2980,7 +3016,7 @@ PROCEDURE xxemr_run_auto (
 -- ----------------------------------------------------------------
     p_run_id               OUT NUMBER,
     p_top_n                IN  NUMBER   DEFAULT 3,
-    p_date_window_days     IN  NUMBER   DEFAULT 20,
+    p_date_window_days     IN  NUMBER   DEFAULT 100,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
