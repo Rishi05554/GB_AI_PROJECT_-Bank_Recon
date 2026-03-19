@@ -1,4 +1,4 @@
-create or replace PACKAGE BODY XXEMR_BANK_RECONCILIATION_PKG AS
+CREATE OR REPLACE PACKAGE BODY XXEMR_BANK_RECONCILIATION_PKG AS
 
 -- ================================================================
 -- PACKAGE BODY : XXEMR_BANK_RECONCILIATION_PKG
@@ -2159,7 +2159,394 @@ EXCEPTION
         RAISE;
 END xxemr_create_me_external_transaction;
 
+PROCEDURE XXEMR_EXT_TRX_VOID_FLAG AS
 
+  CURSOR c_ext_trx IS SELECT
+                                                             et.ext_txn_id,
+                                                             et.transaction_id,
+                                                             et.amount,
+                                                             et.currency_code,
+                                                             et.transaction_date,
+                                                             et.bank_account_num,
+                                                             et.iban,
+                                                             et.bank_id,
+                                                             et.recon_status,
+                                                             et.match_flag
+                                                         FROM
+                                                             xxemr_external_transactions et
+    WHERE   NVL(et.MATCH_FLAG, 'N') != 'VOID'; 
+
+  v_rcpt_count      NUMBER := 0;
+  v_recon_flag      XXEMR_AR_CASH_RECEIPTS.RECON_FLAG%TYPE;
+  v_match_flag      XXEMR_AR_CASH_RECEIPTS.MATCH_FLAG%TYPE;
+  v_status          XXEMR_AR_CASH_RECEIPTS.STATUS%TYPE;
+  v_cash_receipt_id XXEMR_AR_CASH_RECEIPTS.CASH_RECEIPT_ID%TYPE;
+
+  v_updated_count   NUMBER := 0;
+  v_processed_count NUMBER := 0;
+  v_error_count     NUMBER := 0;
+  log_msg			VARCHAR2(2000);
+  p_source			VARCHAR2(100):='XXEMR_EXT_TRX_VOID_FLAG';
+
+BEGIN
+
+  log_msg :='XXEMR_EXT_TRX_VOID_FLAG - START: ' || TO_CHAR(SYSDATE, 'DD-MON-YYYY HH24:MI:SS');
+  xxemr_log(p_source, log_msg);
+  
+  FOR r_ext IN c_ext_trx LOOP
+
+    v_rcpt_count      := 0;
+    v_recon_flag      := NULL;
+    v_match_flag      := NULL;
+    v_status          := NULL;
+    v_cash_receipt_id := NULL;
+
+    BEGIN
+
+      -- -------------------------------------------------------
+      -- Match Receipt by: AMOUNT + CURRENCY + DATE + BANK info
+      -- -------------------------------------------------------
+      SELECT  cr.CASH_RECEIPT_ID,
+              cr.RECON_FLAG,
+              cr.MATCH_FLAG,
+              cr.STATUS
+      INTO    v_cash_receipt_id,
+              v_recon_flag,
+              v_match_flag,
+              v_status
+      FROM    XXEMR_AR_CASH_RECEIPTS cr
+      WHERE   cr.AMOUNT        = r_ext.AMOUNT
+      AND     cr.CURRENCY_CODE = r_ext.CURRENCY_CODE
+      AND     (cr.RECEIPT_DATE  = r_ext.TRANSACTION_DATE OR cr.GL_DATE  = r_ext.TRANSACTION_DATE)
+      AND     (
+                  cr.BANK_ACCOUNT_NUM = r_ext.BANK_ACCOUNT_NUM
+               OR cr.IBAN             = r_ext.IBAN
+               OR cr.BANK_ID          = r_ext.BANK_ID
+              )
+      AND     cr.STATUS NOT IN ('REVERSED', 'DELETED')
+      AND     ROWNUM = 1;  -- Take first match
+
+      v_processed_count := v_processed_count + 1;
+
+      -- -------------------------------------------------------
+      -- If matched receipt is RECONCILED → set VOID_FLAG on ET
+      -- -------------------------------------------------------
+      IF NVL(v_recon_flag, 'N') = 'Y'
+         OR NVL(v_match_flag, 'N') IN ('MATCHED', 'RECONCILED')
+         OR NVL(v_status, 'X')    IN ('REMITTED', 'CLEARED')
+      THEN
+		
+        UPDATE  XXEMR_EXTERNAL_TRANSACTIONS et
+        SET     et.MATCH_FLAG       = '',
+                et.RECON_STATUS     = 'VOID',
+                et.AI_STATUS        = 'VOID_FLAGGED_BY_AI',
+                et.LAST_UPDATE_DATE = SYSDATE,
+                et.LAST_UPDATED_BY  = 'SYSTEM'   
+        WHERE   et.EXT_TXN_ID = r_ext.EXT_TXN_ID;
+
+        v_updated_count := v_updated_count + 1;
+
+        log_msg:=
+          'VOID_FLAG SET → EXT_TXN_ID: ' || r_ext.EXT_TXN_ID
+          || ' | CASH_RECEIPT_ID: '       || v_cash_receipt_id
+          || ' | AMOUNT: '                || r_ext.AMOUNT
+          || ' | DATE: '                  || TO_CHAR(r_ext.TRANSACTION_DATE, 'DD-MON-YYYY');
+		xxemr_log(p_source, log_msg);
+		
+      ELSE
+        log_msg:=
+          'MATCH FOUND (NOT RECONCILED) → EXT_TXN_ID: ' || r_ext.EXT_TXN_ID
+          || ' | CASH_RECEIPT_ID: '                      || v_cash_receipt_id
+          || ' | RECON_FLAG: '                           || v_recon_flag
+        ;
+		xxemr_log(p_source, log_msg);
+      END IF;
+
+    EXCEPTION
+	
+      WHEN NO_DATA_FOUND THEN
+        NULL;
+		
+      WHEN TOO_MANY_ROWS THEN
+	  
+        v_error_count := v_error_count + 1;
+        LOG_MSG:=
+          'WARN - MULTIPLE MATCHES → EXT_TXN_ID: ' || r_ext.EXT_TXN_ID
+          || ' | AMOUNT: '                          || r_ext.AMOUNT
+          || ' | DATE: '                            || TO_CHAR(r_ext.TRANSACTION_DATE, 'DD-MON-YYYY');
+		  
+		xxemr_log(p_source, log_msg);
+		
+      WHEN OTHERS THEN
+        v_error_count := v_error_count + 1;
+        LOG_MSG:='ERROR → EXT_TXN_ID: ' || r_ext.EXT_TXN_ID || ' | ' || SQLERRM;
+		xxemr_log(p_source, log_msg);
+		
+    END;
+
+  END LOOP;
+
+  COMMIT;
+
+	LOG_MSG := '========================================';
+	xxemr_log(p_source, LOG_MSG);
+
+	LOG_MSG := 'SUMMARY:';
+	xxemr_log(p_source, LOG_MSG);
+
+	LOG_MSG := '  Processed (matched) : ' || v_processed_count;
+	xxemr_log(p_source, LOG_MSG);
+
+	LOG_MSG := '  VOID_FLAG Updated   : ' || v_updated_count;
+	xxemr_log(p_source, LOG_MSG);
+
+	LOG_MSG := '  Warnings/Errors     : ' || v_error_count;
+	xxemr_log(p_source, LOG_MSG);
+
+	LOG_MSG := 'XXEMR_EXT_TRX_VOID_FLAG - END: ' || 
+			   TO_CHAR(SYSDATE, 'DD-MON-YYYY HH24:MI:SS');
+	xxemr_log(p_source, LOG_MSG);
+
+	LOG_MSG := '========================================';
+	xxemr_log(p_source, LOG_MSG);
+
+EXCEPTION
+  WHEN OTHERS THEN
+    ROLLBACK;
+    LOG_MSG:='FATAL ERROR: ' || SQLERRM;
+	xxemr_log(p_source, LOG_MSG);
+    RAISE;
+END XXEMR_EXT_TRX_VOID_FLAG;
+
+-- ============================================================
+-- PROCEDURE 2: Confirm and void a single ext txn after
+--              user review. Called per statement_line_id
+--              once the user approves.
+-- ============================================================
+PROCEDURE xxemr_call_void_api (
+        p_fusion_txn_id IN  VARCHAR2,
+        x_api_status    OUT NUMBER,
+        x_api_response  OUT CLOB
+    )
+    IS
+        v_base_endpoint  VARCHAR2(500);
+        v_full_endpoint  VARCHAR2(600);
+        v_username       VARCHAR2(200);
+        v_password       VARCHAR2(200);
+        v_payload        VARCHAR2(500);
+		p_source		 VARCHAR2(200):='xxemr_call_void_api';
+		LOG_MSG          VARCHAR2(2000);
+    BEGIN
+        -- Read credentials / base URL from config (same keys used by CREATE proc)
+        /*SELECT config_value INTO v_base_endpoint
+          FROM apex_recon_config
+         WHERE config_key = 'FUSION_CE_EXT_TXN_ENDPOINT';*/
+		 v_base_endpoint:='https://emhm-dev18.fa.ocs.oraclecloud.com/fscmRestApi/resources/11.13.18.05/cashExternalTransactions/';
+
+        SELECT config_value INTO v_username
+          FROM apex_recon_config
+         WHERE config_key = 'FUSION_API_USERNAME';
+
+        SELECT config_value INTO v_password
+          FROM apex_recon_config
+         WHERE config_key = 'FUSION_API_PASSWORD';
+
+        -- Build resource URL:
+        --   <base>/{ExternalTransactionId}
+        -- Strip any trailing slash from base to avoid double //
+        v_full_endpoint := v_base_endpoint || p_fusion_txn_id;
+
+        -- Clear headers then set Content-Type
+        apex_web_service.g_request_headers.DELETE;
+        apex_web_service.g_request_headers(1).name  := 'Content-Type';
+        apex_web_service.g_request_headers(1).value := 'application/json';
+
+        LOG_MSG:= 'VOID ' || '| TXN= ' || p_fusion_txn_id;
+		xxemr_log(p_source, LOG_MSG);
+		
+
+            -- ------------------------------------------------
+            --  HTTP PATCH with VoidFlag payload
+            -- ------------------------------------------------
+            v_payload := '{
+							"Status" : "VOID"
+						  }';
+
+            x_api_response := apex_web_service.make_rest_request(
+                p_url         => v_full_endpoint,
+                p_http_method => 'PATCH',
+                p_username    => v_username,
+                p_password    => v_password,
+                p_body        => v_payload
+            );
+
+        x_api_status := apex_web_service.g_status_code;
+
+        -- Treat empty response as an error
+        IF x_api_response IS NULL OR LENGTH(TRIM(x_api_response)) = 0 THEN
+            x_api_status   := NVL(x_api_status, -1);
+            x_api_response := 'ERROR: Empty response from Fusion API.'
+                           || ' HTTP Status: ' || x_api_status
+                           || ' | FusionTxnId: ' || p_fusion_txn_id;
+			xxemr_log(p_source, x_api_response);
+        END IF;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            x_api_status   := NVL(x_api_status, -1);
+            x_api_response := 'apex_web_service error: '
+                           || SUBSTR(SQLERRM, 1, 500);
+			xxemr_log(p_source, x_api_response);
+            RAISE;
+    END xxemr_call_void_api;
+
+-- ============================================================
+-- PROCEDURE 3: Accept comma-separated EXT_TXN_IDs, call the
+--              Fusion void API for each, and update status.
+-- ============================================================
+PROCEDURE xxemr_bulk_void_by_ids (
+    p_ext_txn_ids IN VARCHAR2   -- e.g. '1001,1002,1003'
+)
+IS
+    v_api_status    NUMBER;
+    v_api_response  CLOB;
+    v_fusion_txn_id XXEMR_EXTERNAL_TRANSACTIONS.FUSION_EXT_TXN_ID%TYPE;
+    v_ext_txn_id    VARCHAR2(100);
+
+    v_success_count NUMBER := 0;
+    v_error_count   NUMBER := 0;
+    v_skip_count    NUMBER := 0;
+    v_total_count   NUMBER := 0;
+
+    log_msg  VARCHAR2(2000);
+    p_source VARCHAR2(100) := 'XXEMR_BULK_VOID_BY_IDS';
+
+    -- --------------------------------------------------------
+    -- Split comma-separated string into rows using CONNECT BY
+    -- --------------------------------------------------------
+    CURSOR c_ids IS
+        SELECT TRIM(REGEXP_SUBSTR(p_ext_txn_ids, '[^,]+', 1, LEVEL)) AS ext_txn_id
+        FROM   DUAL
+        CONNECT BY LEVEL <= REGEXP_COUNT(p_ext_txn_ids, '[^,]+');
+
+BEGIN
+
+    log_msg := 'START: ' || TO_CHAR(SYSDATE, 'DD-MON-YYYY HH24:MI:SS')
+               || ' | Input IDs: ' || p_ext_txn_ids;
+    xxemr_log(p_source, log_msg);
+
+    FOR r_id IN c_ids LOOP
+
+        v_ext_txn_id    := r_id.ext_txn_id;
+        v_fusion_txn_id := NULL;
+        v_api_status    := NULL;
+        v_api_response  := NULL;
+        v_total_count   := v_total_count + 1;
+
+        BEGIN
+
+            -- ------------------------------------------------
+            -- 1. Fetch the Fusion TXN ID + guard: skip if
+            --    already VOIDED or MATCH_FLAG already VOID
+            -- ------------------------------------------------
+            SELECT et.FUSION_EXT_TXN_ID
+            INTO   v_fusion_txn_id
+            FROM   XXEMR_EXTERNAL_TRANSACTIONS et
+            WHERE  et.EXT_TXN_ID = v_ext_txn_id
+            AND    NVL(et.MATCH_FLAG, 'N') != 'VOID'   -- skip already voided
+            AND    NVL(et.AI_STATUS,  'X') != 'VOIDED_BY_API';
+
+            -- ------------------------------------------------
+            -- 2. Call the Fusion void API
+            -- ------------------------------------------------
+            xxemr_call_void_api(
+                p_fusion_txn_id => v_fusion_txn_id,
+                x_api_status    => v_api_status,
+                x_api_response  => v_api_response
+            );
+
+            -- ------------------------------------------------
+            -- 3. On success (HTTP 200 or 204) → update flags
+            -- ------------------------------------------------
+            IF v_api_status IN (200, 204) THEN
+
+                UPDATE XXEMR_EXTERNAL_TRANSACTIONS
+                SET    MATCH_FLAG       = 'VOID',
+                       AI_STATUS        = 'VOIDED_BY_API',
+                       LAST_UPDATE_DATE = SYSDATE,
+                       LAST_UPDATED_BY  = 'SYSTEM'
+                WHERE  EXT_TXN_ID = v_ext_txn_id;
+
+                v_success_count := v_success_count + 1;
+
+                log_msg := 'VOIDED OK → EXT_TXN_ID: ' || v_ext_txn_id
+                           || ' | FUSION_TXN_ID: '     || v_fusion_txn_id
+                           || ' | HTTP: '              || v_api_status;
+                xxemr_log(p_source, log_msg);
+
+            ELSE
+            -- ------------------------------------------------
+            -- 4. Non-success HTTP → log, do NOT update flags
+            -- ------------------------------------------------
+                v_error_count := v_error_count + 1;
+
+                log_msg := 'API ERROR → EXT_TXN_ID: ' || v_ext_txn_id
+                           || ' | FUSION_TXN_ID: '     || v_fusion_txn_id
+                           || ' | HTTP: '              || v_api_status
+                           || ' | Response: '          || SUBSTR(v_api_response, 1, 500);
+                xxemr_log(p_source, log_msg);
+
+            END IF;
+
+        EXCEPTION
+
+            WHEN NO_DATA_FOUND THEN
+                -- Row missing OR already voided — skip silently
+                v_skip_count := v_skip_count + 1;
+                log_msg := 'SKIPPED → EXT_TXN_ID: ' || v_ext_txn_id
+                           || ' (not found or already VOID)';
+                xxemr_log(p_source, log_msg);
+
+            WHEN OTHERS THEN
+                v_error_count := v_error_count + 1;
+                log_msg := 'ERROR → EXT_TXN_ID: ' || v_ext_txn_id
+                           || ' | ' || SQLERRM;
+                xxemr_log(p_source, log_msg);
+
+        END;
+
+    END
+    loop;
+    COMMIT;
+
+    -- --------------------------------------------------------
+    -- Summary block
+    -- --------------------------------------------------------
+    log_msg := '========================================';
+    xxemr_log(p_source, log_msg);
+    log_msg := 'SUMMARY:';
+    xxemr_log(p_source, log_msg);
+    log_msg := '  Total Submitted : ' || v_total_count;
+    xxemr_log(p_source, log_msg);
+    log_msg := '  Voided (API OK) : ' || v_success_count;
+    xxemr_log(p_source, log_msg);
+    log_msg := '  Skipped (dup)   : ' || v_skip_count;
+    xxemr_log(p_source, log_msg);
+    log_msg := '  Errors          : ' || v_error_count;
+    xxemr_log(p_source, log_msg);
+    log_msg := 'END: ' || to_char(sysdate, 'DD-MON-YYYY HH24:MI:SS');
+    xxemr_log(p_source, log_msg);
+    log_msg := '========================================';
+    xxemr_log(p_source, log_msg);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        log_msg := 'FATAL ERROR: ' || SQLERRM;
+        xxemr_log(p_source, log_msg);
+        RAISE;
+
+END xxemr_bulk_void_by_ids;
 -- ================================================================
 -- SECTION 6 — ONE-TO-ONE AI MATCHING ENGINE
 -- ================================================================
