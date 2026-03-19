@@ -1,5 +1,5 @@
 CREATE OR REPLACE PACKAGE XXEMR_BANK_RECONCILIATION_PKG AS
- 
+
 -- ================================================================
 -- PACKAGE SPEC : XXEMR_BANK_RECONCILIATION_PKG
 -- Description  : Consolidated Bank Reconciliation package.
@@ -10,12 +10,12 @@ CREATE OR REPLACE PACKAGE XXEMR_BANK_RECONCILIATION_PKG AS
 --   4  One-to-One AI Matching Engine
 --   5  One-to-Many AI Matching Engine
 -- ================================================================
- 
- 
+
+
 -- ================================================================
 -- SECTION 1 — MANUAL RECONCILIATION
 -- ================================================================
- 
+
 PROCEDURE xxemr_process_manual_match (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_process_manual_match
@@ -34,12 +34,12 @@ PROCEDURE xxemr_process_manual_match (
     p_candidates        IN VARCHAR2,
     p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
 );
- 
- 
+
+
 -- ================================================================
 -- SECTION 2 — AI MATCH APPLICATION
 -- ================================================================
- 
+
 PROCEDURE xxemr_apply_ai_match (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_apply_ai_match
@@ -55,8 +55,8 @@ PROCEDURE xxemr_apply_ai_match (
     p_match_group_id IN NUMBER,
     p_user           IN VARCHAR2 DEFAULT 'SYSTEM'
 );
- 
- 
+
+
 PROCEDURE xxemr_confirm_ai_match (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_confirm_ai_match
@@ -71,12 +71,12 @@ PROCEDURE xxemr_confirm_ai_match (
     p_statement_line_id IN NUMBER,
     p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
 );
- 
- 
+
+
 -- ================================================================
 -- SECTION 3 — EXTERNAL TRANSACTION PROCESSING
 -- ================================================================
- 
+
 PROCEDURE xxemr_process_external_transactions;
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_process_external_transactions
@@ -93,8 +93,8 @@ PROCEDURE xxemr_process_external_transactions;
 --               NOTHING  → PENDING_APPROVAL   → EXT_PENDING group
 --             Called by a scheduled DBMS_SCHEDULER job.
 -- ----------------------------------------------------------------
- 
- 
+
+
 PROCEDURE xxemr_create_pw_external_transaction (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_create_pw_external_transaction
@@ -110,8 +110,8 @@ PROCEDURE xxemr_create_pw_external_transaction (
 -- ----------------------------------------------------------------
     p_statement_line_id IN NUMBER
 );
- 
- 
+
+
 PROCEDURE xxemr_create_me_external_transaction (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_create_me_external_transaction
@@ -127,8 +127,8 @@ PROCEDURE xxemr_create_me_external_transaction (
 -- ----------------------------------------------------------------
     p_statement_line_id IN NUMBER
 );
- 
- 
+
+
 PROCEDURE XXEMR_EXT_TRX_VOID_FLAG ;
 -- ----------------------------------------------------------------
 -- PROCEDURE : XXEMR_EXT_TRX_VOID_FLAG
@@ -155,8 +155,8 @@ PROCEDURE XXEMR_EXT_TRX_VOID_FLAG ;
 --             the flagged rows via the API after review.
 --			Has to be scheduled
 -- ----------------------------------------------------------------
- 
- 
+
+
 PROCEDURE xxemr_call_void_api (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_call_void_api
@@ -187,8 +187,9 @@ PROCEDURE xxemr_call_void_api (
         x_api_status    OUT NUMBER,
         x_api_response  OUT CLOB
     );
- 
- 
+
+
+
 PROCEDURE xxemr_bulk_void_by_ids (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_bulk_void_by_ids
@@ -218,12 +219,13 @@ PROCEDURE xxemr_bulk_void_by_ids (
 -- ----------------------------------------------------------------
     p_ext_txn_ids IN VARCHAR2   -- e.g. '1001,1002,1003'
 );
- 
- 
+
+
+
 -- ================================================================
 -- SECTION 4 — ONE-TO-ONE AI MATCHING ENGINE
 -- ================================================================
- 
+
 PROCEDURE xxemr_suggest_one_to_one_match (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_suggest_one_to_one_match
@@ -255,12 +257,12 @@ PROCEDURE xxemr_suggest_one_to_one_match (
 -- ----------------------------------------------------------------
     p_statement_line_id IN  NUMBER,
     p_top_n             IN  NUMBER   DEFAULT 3,
-    p_date_window_days  IN  NUMBER   DEFAULT 20,
-    p_amount_tolerance  IN  NUMBER   DEFAULT 0.5,
+    p_date_window_days  IN  NUMBER   DEFAULT 100,
+    p_amount_tolerance  IN  NUMBER   DEFAULT 1,
     p_result            OUT SYS_REFCURSOR
 );
- 
- 
+
+
 PROCEDURE xxemr_run_one_to_one_batch (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_run_one_to_one_batch
@@ -280,17 +282,17 @@ PROCEDURE xxemr_run_one_to_one_batch (
 --   p_created_by         — audit user (default 'SYSTEM')
 -- ----------------------------------------------------------------
     p_bank_account_id  IN  NUMBER,
-    p_date_window_days IN  NUMBER   DEFAULT 20,
-    p_amount_tolerance IN  NUMBER   DEFAULT 0.5,
+    p_date_window_days IN  NUMBER   DEFAULT 100,
+    p_amount_tolerance IN  NUMBER   DEFAULT 1,
     p_top_n            IN  NUMBER   DEFAULT 3,
     p_created_by       IN  VARCHAR2 DEFAULT 'SYSTEM'
 );
- 
- 
+
+
 -- ================================================================
 -- SECTION 5 — ONE-TO-MANY AI MATCHING ENGINE
 -- ================================================================
- 
+
 PROCEDURE xxemr_suggest_line_matches (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_suggest_line_matches
@@ -327,7 +329,7 @@ PROCEDURE xxemr_suggest_line_matches (
 -- ----------------------------------------------------------------
     p_statement_line_id    IN  NUMBER,
     p_top_n                IN  NUMBER   DEFAULT 3,
-    p_date_window_days     IN  NUMBER   DEFAULT 15,
+    p_date_window_days     IN  NUMBER   DEFAULT 100,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
@@ -335,8 +337,8 @@ PROCEDURE xxemr_suggest_line_matches (
     p_allow_one_to_many    IN  VARCHAR2 DEFAULT 'Y',
     p_result               OUT SYS_REFCURSOR
 );
- 
- 
+
+
 PROCEDURE xxemr_run_batch (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_run_batch
@@ -364,14 +366,14 @@ PROCEDURE xxemr_run_batch (
     p_stmt_from_date       IN  DATE,
     p_stmt_to_date         IN  DATE,
     p_top_n                IN  NUMBER   DEFAULT 3,
-    p_date_window_days     IN  NUMBER   DEFAULT 15,
+    p_date_window_days     IN  NUMBER   DEFAULT 100,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
     p_commit_interval      IN  NUMBER   DEFAULT 200
 );
- 
- 
+
+
 PROCEDURE xxemr_run_auto (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_run_auto
@@ -392,18 +394,18 @@ PROCEDURE xxemr_run_auto (
 -- ----------------------------------------------------------------
     p_run_id               OUT NUMBER,
     p_top_n                IN  NUMBER   DEFAULT 3,
-    p_date_window_days     IN  NUMBER   DEFAULT 15,
+    p_date_window_days     IN  NUMBER   DEFAULT 100,
     p_amount_tolerance     IN  NUMBER   DEFAULT 0,
     p_max_combo_size       IN  NUMBER   DEFAULT 5,
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
     p_commit_interval      IN  NUMBER   DEFAULT 200
 );
- 
- 
+
+
 -- ================================================================
 -- SECTION 6 — STATEMENT ACTION DISPATCHER
 -- ================================================================
- 
+
 PROCEDURE xxemr_process_statement_action (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_process_statement_action
@@ -425,8 +427,8 @@ PROCEDURE xxemr_process_statement_action (
     p_candidates        IN VARCHAR2 DEFAULT NULL,
     p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
 );
- 
- 
+
+
 PROCEDURE xxemr_process_statement_action_bulk (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_process_statement_action_bulk
@@ -453,7 +455,7 @@ PROCEDURE xxemr_process_statement_action_bulk (
     p_error_count        OUT NUMBER,
     p_error_summary      OUT VARCHAR2
 );
- 
- 
+
+
 END XXEMR_BANK_RECONCILIATION_PKG;
 /
