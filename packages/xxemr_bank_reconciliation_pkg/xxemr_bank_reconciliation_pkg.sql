@@ -1,5 +1,5 @@
-create or replace PACKAGE XXEMR_BANK_RECONCILIATION_PKG AS
-
+CREATE OR REPLACE PACKAGE XXEMR_BANK_RECONCILIATION_PKG AS
+ 
 -- ================================================================
 -- PACKAGE SPEC : XXEMR_BANK_RECONCILIATION_PKG
 -- Description  : Consolidated Bank Reconciliation package.
@@ -10,12 +10,12 @@ create or replace PACKAGE XXEMR_BANK_RECONCILIATION_PKG AS
 --   4  One-to-One AI Matching Engine
 --   5  One-to-Many AI Matching Engine
 -- ================================================================
-
-
+ 
+ 
 -- ================================================================
 -- SECTION 1 — MANUAL RECONCILIATION
 -- ================================================================
-
+ 
 PROCEDURE xxemr_process_manual_match (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_process_manual_match
@@ -34,12 +34,12 @@ PROCEDURE xxemr_process_manual_match (
     p_candidates        IN VARCHAR2,
     p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
 );
-
-
+ 
+ 
 -- ================================================================
 -- SECTION 2 — AI MATCH APPLICATION
 -- ================================================================
-
+ 
 PROCEDURE xxemr_apply_ai_match (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_apply_ai_match
@@ -55,8 +55,8 @@ PROCEDURE xxemr_apply_ai_match (
     p_match_group_id IN NUMBER,
     p_user           IN VARCHAR2 DEFAULT 'SYSTEM'
 );
-
-
+ 
+ 
 PROCEDURE xxemr_confirm_ai_match (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_confirm_ai_match
@@ -71,12 +71,12 @@ PROCEDURE xxemr_confirm_ai_match (
     p_statement_line_id IN NUMBER,
     p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
 );
-
-
+ 
+ 
 -- ================================================================
 -- SECTION 3 — EXTERNAL TRANSACTION PROCESSING
 -- ================================================================
-
+ 
 PROCEDURE xxemr_process_external_transactions;
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_process_external_transactions
@@ -93,8 +93,8 @@ PROCEDURE xxemr_process_external_transactions;
 --               NOTHING  → PENDING_APPROVAL   → EXT_PENDING group
 --             Called by a scheduled DBMS_SCHEDULER job.
 -- ----------------------------------------------------------------
-
-
+ 
+ 
 PROCEDURE xxemr_create_pw_external_transaction (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_create_pw_external_transaction
@@ -110,8 +110,8 @@ PROCEDURE xxemr_create_pw_external_transaction (
 -- ----------------------------------------------------------------
     p_statement_line_id IN NUMBER
 );
-
-
+ 
+ 
 PROCEDURE xxemr_create_me_external_transaction (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_create_me_external_transaction
@@ -127,12 +127,103 @@ PROCEDURE xxemr_create_me_external_transaction (
 -- ----------------------------------------------------------------
     p_statement_line_id IN NUMBER
 );
-
-
+ 
+ 
+PROCEDURE XXEMR_EXT_TRX_VOID_FLAG ;
+-- ----------------------------------------------------------------
+-- PROCEDURE : XXEMR_EXT_TRX_VOID_FLAG
+-- Purpose   : Automated background scan that identifies external
+--             transactions which can be safely voided because a
+--             matching reconciled AR cash receipt already exists
+--             in the system.
+--             Iterates all non-voided rows in
+--             XXEMR_EXTERNAL_TRANSACTIONS and attempts to find a
+--             corresponding receipt in XXEMR_AR_CASH_RECEIPTS
+--             matched on: amount, currency, transaction date
+--             (RECEIPT_DATE or GL_DATE), and at least one of
+--             bank account number, IBAN, or bank ID.
+--             When the matched receipt is confirmed reconciled
+--             (RECON_FLAG='Y', MATCH_FLAG IN ('MATCHED','RECONCILED')
+--             or STATUS IN ('REMITTED','CLEARED')), the external
+--             transaction is flagged:
+--               MATCH_FLAG   = 'VOID'
+--               RECON_STATUS = 'VOID'
+--               AI_STATUS    = 'VOID_FLAGGED_BY_AI'
+--             Intended to run as a scheduled background job before
+--             the main reconciliation cycle. Does not call the
+--             Fusion API — use XXEMR_BULK_VOID_BY_IDS to action
+--             the flagged rows via the API after review.
+--			Has to be scheduled
+-- ----------------------------------------------------------------
+ 
+ 
+PROCEDURE xxemr_call_void_api (
+-- ----------------------------------------------------------------
+-- PROCEDURE : xxemr_call_void_api
+-- Purpose   : Submits a PATCH request to the Oracle Fusion CE
+--             cashExternalTransactions REST API to void a single
+--             external transaction.
+--             Reads the base endpoint URL, username, and password
+--             from APEX_RECON_CONFIG at runtime so no credentials
+--             are hardcoded.
+--             The payload sent is: { "Status": "VOID" }
+--             An empty or NULL API response is treated as an error
+--             and returned to the caller via the OUT parameters
+--             rather than raised, allowing the calling procedure
+--             to decide how to handle the failure.
+-- Parameters:
+--   p_fusion_txn_id  — Fusion External Transaction ID appended to
+--                      the base endpoint URL to form the resource
+--                      URI: <FUSION_CE_EXT_TXN_ENDPOINT>/{id}
+--   x_api_status     — HTTP status code returned by Fusion.
+--                      200 or 204 indicate success.
+--                      -1 indicates a connection-level failure or
+--                      empty response.
+--   x_api_response   — Raw CLOB response body from Fusion, or an
+--                      error message string if the call failed.
+-- Called by : xxemr_bulk_void_by_ids
+-- ----------------------------------------------------------------
+        p_fusion_txn_id IN  VARCHAR2,
+        x_api_status    OUT NUMBER,
+        x_api_response  OUT CLOB
+    );
+ 
+ 
+PROCEDURE xxemr_bulk_void_by_ids (
+-- ----------------------------------------------------------------
+-- PROCEDURE : xxemr_bulk_void_by_ids
+-- Purpose   : Bulk void orchestrator. Accepts a comma-separated
+--             list of internal EXT_TXN_IDs, resolves each to its
+--             Fusion External Transaction ID, calls
+--             xxemr_call_void_api per record, and on a successful
+--             HTTP 200 or 204 response stamps the transaction row:
+--               MATCH_FLAG  = 'VOID'
+--               AI_STATUS   = 'VOIDED_BY_API'
+--             Rows that are already voided (MATCH_FLAG = 'VOID' or
+--             AI_STATUS = 'VOIDED_BY_API') are silently skipped
+--             and counted separately — they do not count as errors.
+--             Each ID is processed in its own inner BEGIN/EXCEPTION
+--             block so a single failure never aborts the batch.
+--             A single COMMIT is issued at the end of the loop;
+--             a ROLLBACK is issued only on a fatal outer exception.
+-- Parameters:
+--   p_ext_txn_ids  — Comma-separated list of EXT_TXN_ID values
+--                    from XXEMR_EXTERNAL_TRANSACTIONS.
+--                    e.g. '1001,1002,1003'
+--                    Whitespace around commas is trimmed.
+--                    Passing a single ID is valid.
+-- Calls     : xxemr_call_void_api  (once per non-skipped ID)
+-- Called by : APEX UI after user review of VOID_FLAGGED_BY_AI
+--             rows surfaced by XXEMR_EXT_TRX_VOID_FLAG.
+-- ----------------------------------------------------------------
+    p_ext_txn_ids IN VARCHAR2   -- e.g. '1001,1002,1003'
+);
+ 
+ 
 -- ================================================================
 -- SECTION 4 — ONE-TO-ONE AI MATCHING ENGINE
 -- ================================================================
-
+ 
 PROCEDURE xxemr_suggest_one_to_one_match (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_suggest_one_to_one_match
@@ -168,8 +259,8 @@ PROCEDURE xxemr_suggest_one_to_one_match (
     p_amount_tolerance  IN  NUMBER   DEFAULT 0.5,
     p_result            OUT SYS_REFCURSOR
 );
-
-
+ 
+ 
 PROCEDURE xxemr_run_one_to_one_batch (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_run_one_to_one_batch
@@ -194,12 +285,12 @@ PROCEDURE xxemr_run_one_to_one_batch (
     p_top_n            IN  NUMBER   DEFAULT 3,
     p_created_by       IN  VARCHAR2 DEFAULT 'SYSTEM'
 );
-
-
+ 
+ 
 -- ================================================================
 -- SECTION 5 — ONE-TO-MANY AI MATCHING ENGINE
 -- ================================================================
-
+ 
 PROCEDURE xxemr_suggest_line_matches (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_suggest_line_matches
@@ -244,8 +335,8 @@ PROCEDURE xxemr_suggest_line_matches (
     p_allow_one_to_many    IN  VARCHAR2 DEFAULT 'Y',
     p_result               OUT SYS_REFCURSOR
 );
-
-
+ 
+ 
 PROCEDURE xxemr_run_batch (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_run_batch
@@ -279,8 +370,8 @@ PROCEDURE xxemr_run_batch (
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
     p_commit_interval      IN  NUMBER   DEFAULT 200
 );
-
-
+ 
+ 
 PROCEDURE xxemr_run_auto (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_run_auto
@@ -307,12 +398,12 @@ PROCEDURE xxemr_run_auto (
     p_max_receipt_pool     IN  NUMBER   DEFAULT 15,
     p_commit_interval      IN  NUMBER   DEFAULT 200
 );
-
-
+ 
+ 
 -- ================================================================
 -- SECTION 6 — STATEMENT ACTION DISPATCHER
 -- ================================================================
-
+ 
 PROCEDURE xxemr_process_statement_action (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_process_statement_action
@@ -334,8 +425,8 @@ PROCEDURE xxemr_process_statement_action (
     p_candidates        IN VARCHAR2 DEFAULT NULL,
     p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
 );
-
-
+ 
+ 
 PROCEDURE xxemr_process_statement_action_bulk (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_process_statement_action_bulk
@@ -362,7 +453,7 @@ PROCEDURE xxemr_process_statement_action_bulk (
     p_error_count        OUT NUMBER,
     p_error_summary      OUT VARCHAR2
 );
-
-
+ 
+ 
 END XXEMR_BANK_RECONCILIATION_PKG;
 /
