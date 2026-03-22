@@ -1,4 +1,4 @@
-CREATE OR REPLACE PACKAGE BODY XXEMR_BANK_RECONCILIATION_PKG AS
+create or replace PACKAGE BODY XXEMR_BANK_RECONCILIATION_PKG AS
 
 -- ================================================================
 -- PACKAGE BODY : XXEMR_BANK_RECONCILIATION_PKG
@@ -452,6 +452,7 @@ BEGIN
     UPDATE xxemr_bank_statement_lines
        SET ai_status        = p_status,
            recon_status     = 'REC',
+           application_recon_status = 'RECONCILED',
            approval_status  = 'APPROVED',
            match_flag       = p_match_flag,
            last_update_date = SYSTIMESTAMP,
@@ -1891,6 +1892,7 @@ BEGIN
                dashboard_flag     = 'N',
                dashboard_message  = NULL,
                recon_status       = 'REC',
+               application_recon_status = 'RECONCILED',
                last_updated       = SYSTIMESTAMP
          WHERE statement_line_id = p_statement_line_id;
 
@@ -2077,6 +2079,7 @@ BEGIN
                dashboard_flag     = 'N',
                dashboard_message  = NULL,
                recon_status       = 'REC',
+               application_recon_status = 'RECONCILED',
                last_updated       = SYSTIMESTAMP
          WHERE statement_line_id = p_statement_line_id;
 
