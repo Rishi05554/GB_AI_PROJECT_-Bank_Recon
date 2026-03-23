@@ -1324,31 +1324,30 @@ BEGIN
     v_html       := CALL_BIP_REPORT(GET_CONFIG('REPORT_PATH_STMT_LINES'));
     v_table_html := EXTRACT_TABLE_HTML(v_html);
 
-    UPDATE xxemr_bank_statement_lines apex_line
-       SET apex_line.recon_status       = 'REC',
-           apex_line.fusion_recon_status = 'REC',
-           apex_line.match_flag         = 'Y',
-           apex_line.bip_last_seen_date = TRUNC(SYSDATE),
-           apex_line.last_updated       = SYSTIMESTAMP
-     WHERE apex_line.recon_status      != 'REC'
-       AND apex_line.statement_line_id IN (
-               SELECT f.statement_line_id
-                 FROM xxemr_recon_fbdi_lines f
-                WHERE f.send_status = 'SENT'
-                  AND f.source_code = 'BS'
-           )
-       AND apex_line.statement_line_id IN (
-               SELECT TO_NUMBER(X.c3 DEFAULT NULL ON CONVERSION ERROR)
-                 FROM XMLTABLE(
-                          '/table/tr[position() > 1]'
-                          PASSING XMLTYPE(v_table_html)
-                          COLUMNS
-                              c3 VARCHAR2(100) PATH 'string(td[3])',
-                              c8 VARCHAR2(20)  PATH 'string(td[8])'   -- td[8] = RECON_STATUS in sync context
-                      ) X
-                WHERE TRIM(X.c8) = 'REC'
-                  AND REGEXP_LIKE(TRIM(X.c3), '^[0-9]+$')
-           );
+UPDATE xxemr_bank_statement_lines apex_line
+   SET apex_line.recon_status         = 'REC',
+       apex_line.fusion_recon_status  = 'REC',
+       apex_line.match_flag           = 'Y',
+       apex_line.bip_last_seen_date   = TRUNC(SYSDATE),
+       apex_line.last_updated         = SYSTIMESTAMP
+ WHERE apex_line.statement_line_id IN (
+           SELECT f.statement_line_id
+             FROM xxemr_recon_fbdi_lines f
+            WHERE f.send_status = 'SENT'
+              AND f.source_code = 'BS'
+       )
+   AND apex_line.statement_line_id IN (
+           SELECT TO_NUMBER(X.c3 DEFAULT NULL ON CONVERSION ERROR)
+             FROM XMLTABLE(
+                      '/table/tr[position() > 1]'
+                      PASSING XMLTYPE(v_table_html)
+                      COLUMNS
+                          c3 VARCHAR2(100) PATH 'string(td[3])',
+                          c8 VARCHAR2(20)  PATH 'string(td[8])'
+                  ) X
+            WHERE UPPER(TRIM(X.c8)) = 'REC'
+              AND REGEXP_LIKE(TRIM(X.c3), '^[0-9]+$')
+       );
 
     v_reconciled_count := SQL%ROWCOUNT;
 
@@ -1387,6 +1386,25 @@ BEGIN
            );
 
     v_rejected_count := SQL%ROWCOUNT;
+
+    -- STEP 5b: Reset statement lines back to UNR where Fusion rejected
+    UPDATE xxemr_bank_statement_lines s
+       SET s.recon_status             = 'UNR',
+           s.fusion_recon_status      = 'UNR',
+           s.application_recon_status = 'FUSION_REJECTED',
+           s.match_flag               = 'N',
+           s.ai_status                = 'FUSION_REJECTED',
+           s.approval_status          = 'PENDING',
+           s.last_update_date         = SYSTIMESTAMP,
+           s.last_updated_by          = 'BIP_SYNC'
+     WHERE s.statement_line_id IN (
+               SELECT DISTINCT f.statement_line_id
+                 FROM xxemr_recon_fbdi_lines f
+                WHERE f.send_status      = 'FUSION_REJECTED'
+                  AND f.source_code      = 'BS'
+                  AND f.last_updated_by  = 'BIP_SYNC'
+                  AND f.last_update_date >= TRUNC(SYSDATE)
+           );
 
     SELECT COUNT(DISTINCT statement_line_id)
       INTO v_unchanged_count
