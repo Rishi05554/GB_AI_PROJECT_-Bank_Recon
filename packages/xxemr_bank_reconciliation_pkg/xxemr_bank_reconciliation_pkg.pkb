@@ -105,7 +105,7 @@ PROCEDURE xxemr_parse_token (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_parse_token
 -- Purpose   : Parses a prefixed candidate token into source + ID.
---             Valid prefixes: AR, EX, ST
+--             Valid prefixes: AR, AP, EX, ST
 -- ----------------------------------------------------------------
     p_token  IN  VARCHAR2,
     p_source OUT VARCHAR2,
@@ -117,17 +117,14 @@ BEGIN
             'Invalid token "' || p_token
             || '" — must be at least 3 characters (2-char prefix + numeric ID)');
     END IF;
-
     p_source := UPPER(SUBSTR(p_token, 1, 2));
     p_id     := TO_NUMBER(SUBSTR(p_token, 3));
-
-    IF p_source NOT IN ('AR', 'EX', 'ST') THEN
+    IF p_source NOT IN ('AR', 'AP', 'EX', 'ST') THEN   -- AP added
         RAISE_APPLICATION_ERROR(-20003,
             'Unknown source prefix "' || p_source
             || '" in token "' || p_token
-            || '" — must be AR, EX, or ST');
+            || '" — must be AR, AP, EX, or ST');        -- AP added
     END IF;
-
 END xxemr_parse_token;
 
 
@@ -135,7 +132,7 @@ PROCEDURE xxemr_fetch_candidate (
 -- ----------------------------------------------------------------
 -- PROCEDURE : xxemr_fetch_candidate
 -- Purpose   : Retrieves amount + date for a candidate from the
---             appropriate source table (AR, EX, or ST).
+--             appropriate source table (AR, AP, EX, or ST).
 -- NOTE      : EX source uses ext_txn_id as PK on
 --             xxemr_external_transactions.
 -- ----------------------------------------------------------------
@@ -150,13 +147,16 @@ BEGIN
           INTO p_amount, p_date
           FROM xxemr_ar_cash_receipts
          WHERE cash_receipt_id = p_id;
-
+    ELSIF p_source = 'AP' THEN                          -- AP added
+        SELECT NVL(amount, 0), NVL(payment_date, SYSDATE)
+          INTO p_amount, p_date
+          FROM xxemr_ap_checks_all
+         WHERE check_id = p_id;
     ELSIF p_source = 'EX' THEN
         SELECT NVL(amount, 0), NVL(transaction_date, SYSDATE)
           INTO p_amount, p_date
           FROM xxemr_external_transactions
-         WHERE ext_txn_id = p_id;      -- ext_txn_id is the PK
-
+         WHERE ext_txn_id = p_id;
     ELSIF p_source = 'ST' THEN
         SELECT NVL(l.amount, 0), NVL(h.statement_date, SYSDATE)
           INTO p_amount, p_date
@@ -165,7 +165,6 @@ BEGIN
             ON l.statement_header_id = h.statement_header_id
          WHERE l.statement_line_id = p_id;
     END IF;
-
 END xxemr_fetch_candidate;
 
 
@@ -328,7 +327,7 @@ PROCEDURE xxemr_insert_match_group (
 --             given Statement Line and set of candidate tokens.
 --             Used by manual match, AI match, and EXT processing.
 --             Tokens are colon-delimited prefixed IDs,
---             e.g. 'AR12345:AR67890:EX111'
+--             e.g. 'AR12345:AR67890:EX111:AP999'
 -- ----------------------------------------------------------------
     p_statement_line_id IN NUMBER,
     p_candidates        IN VARCHAR2,
@@ -343,6 +342,7 @@ PROCEDURE xxemr_insert_match_group (
     l_total_amount     NUMBER        := 0;
     l_candidate_source VARCHAR2(30);
     l_has_ar           BOOLEAN       := FALSE;
+    l_has_ap           BOOLEAN       := FALSE;  -- AP added
     l_has_ext          BOOLEAN       := FALSE;
     l_remaining        VARCHAR2(4000);
     l_pos              NUMBER;
@@ -368,14 +368,20 @@ BEGIN
 
         l_total_amount := l_total_amount + l_cand_amount;
         IF l_source = 'AR' THEN l_has_ar  := TRUE; END IF;
+        IF l_source = 'AP' THEN l_has_ap  := TRUE; END IF;  -- AP added
         IF l_source = 'EX' THEN l_has_ext := TRUE; END IF;
     END LOOP;
 
+    -- More than one distinct source type present = MIXED
     l_candidate_source :=
         CASE
-            WHEN l_has_ar AND l_has_ext THEN 'MIXED'
-            WHEN l_has_ar               THEN 'AR'
-            ELSE                             'EXT'
+            WHEN (CASE WHEN l_has_ar  THEN 1 ELSE 0 END
+                + CASE WHEN l_has_ap  THEN 1 ELSE 0 END
+                + CASE WHEN l_has_ext THEN 1 ELSE 0 END) > 1
+                                    THEN 'MIXED'
+            WHEN l_has_ar           THEN 'AR'
+            WHEN l_has_ap           THEN 'AP'   -- AP added
+            ELSE                         'EXT'
         END;
 
     -- -------------------------------------------------------
@@ -730,7 +736,24 @@ BEGIN
         p_match_group_id    => l_match_group_id,
         p_user              => p_user
     );
+     
+         UPDATE xxemr_bank_statement_lines
+       SET recon_status             = 'REC',
+           application_recon_status = 'RECONCILED',
+           ai_status                = 'AI_RECONCILED',
+           match_flag               = 'Y',
+           approval_status          = 'APPROVED',
+           approved_by              = p_user,
+           approved_date            = SYSTIMESTAMP,
+           last_update_date         = SYSTIMESTAMP,
+           last_updated_by          = p_user
+     WHERE statement_line_id = p_statement_line_id;
 
+         UPDATE xxemr_match_groups
+       SET user_action      = 'ACTION_TAKEN',
+           last_update_date = SYSTIMESTAMP,
+           last_updated_by  = p_user
+     WHERE match_group_id = l_match_group_id;
     -- Step 4: Clean up any EXT_PENDING / EXT_PARTIAL / EXT_CREATED groups
     --         superseded now that an AI match is confirmed.
     DELETE FROM xxemr_match_group_details
@@ -3933,6 +3956,197 @@ EXCEPTION
 
 END xxemr_process_statement_action_bulk;
 
+
+PROCEDURE xxemr_dib_cross_acct_pay_match
+IS
+-- ================================================================
+-- PROCEDURE : xxemr_dib_cross_acct_pay_match
+-- ----------------------------------------------------------------
+-- Purpose   : Identifies cross-account payment anomalies within
+--             DIB Bank where a payment debit appears on a bank
+--             statement (Escrow 2) but the book entry (AP payment)
+--             is recorded in xxemr_ap_checks_all against a
+--             different escrow account (Escrow 1).
+--
+-- Matching Criteria:
+--   - Statement line : DBIT, unreconciled, no user-confirmed match
+--   - AP Check       : same amount + same segment7 (LA)
+--
+-- On Match  : xxemr_insert_match_group called with
+--             match_type = 'CROSS_ACCOUNT'
+--             candidate  = 'AP' || matched check_id
+--
+-- Parameters : None
+-- Called by  : Scheduler / APEX action button
+-- ================================================================
+
+    -- ── Cursor : unmatched DBIT lines for DIB bank ────────────────
+    --   Conditions:
+    --     recon_status = 'UNR'  → not reconciled
+    --     No match group with user_action IN (ACCEPTED, ACTION_TAKEN)
+    --     segment7 is sourced from xxemr_bank_details via the header join
+    CURSOR c_unmatched_lines IS
+        SELECT l.statement_line_id,
+               l.amount,
+               l.statement_date,
+               l.bank_account_id,
+               b.segment7
+          FROM xxemr_bank_statement_lines   l,
+               xxemr_bank_statement_headers h,
+               xxemr_bank_details           b
+         WHERE h.statement_header_id  = l.statement_header_id
+           AND b.bank_account_id      = h.bank_account_id
+           AND UPPER(h.bank_name)     = 'DUBAI ISLAMIC BANK'
+           AND UPPER(l.flow_indicator) = 'DBIT'
+           AND NVL(l.recon_status, 'UNR') = 'UNR'
+           AND NOT EXISTS (
+                   SELECT 1
+                     FROM xxemr_match_groups mg
+                    WHERE mg.statement_line_id = l.statement_line_id
+                      AND mg.user_action IN ('ACCEPTED', 'ACTION_TAKEN')
+               )
+         ORDER BY l.statement_line_id;
+
+    -- ── Variables ─────────────────────────────────────────────────
+    v_matched_check_id  NUMBER;
+    v_match_found       VARCHAR2(1);
+    v_candidates_token  VARCHAR2(200);
+
+    v_total_processed   NUMBER := 0;
+    v_total_matched     NUMBER := 0;
+    v_total_skipped     NUMBER := 0;
+    v_error_count       NUMBER := 0;
+    v_error_message     VARCHAR2(4000);
+    log_msg             VARCHAR2(2000);
+
+    p_source CONSTANT   VARCHAR2(100) := 'xxemr_dib_cross_acct_pay_match';
+
+BEGIN
+
+    xxemr_log(p_source, 'START');
+
+    -- ══════════════════════════════════════════════════════════
+    -- Iterate over all unmatched DIB DBIT lines
+    -- ══════════════════════════════════════════════════════════
+    FOR r_line IN c_unmatched_lines LOOP
+
+        v_match_found     := 'N';
+        v_matched_check_id := NULL;
+        v_total_processed := v_total_processed + 1;
+
+        SAVEPOINT sp_cross_pay_line;
+
+        BEGIN
+
+            log_msg := 'LINE_ID='   || r_line.statement_line_id
+                    || ' | Amount=' || r_line.amount
+                    || ' | Seg7='   || NVL(r_line.segment7, 'NULL');
+            xxemr_log(p_source, log_msg);
+
+            -- ──────────────────────────────────────────────────
+            -- STEP : Search xxemr_ap_checks_all for a payment
+            --        entry with the same amount AND same
+            --        segment7 (LA).
+            --
+            --        recon_flag = 'N' ensures the AP check has
+            --        not already been reconciled on the book side.
+            --
+            --        Note: amount in xxemr_ap_checks_all is the
+            --        absolute payment amount (positive), matching
+            --        the positive DBIT amount on the statement.
+            -- ──────────────────────────────────────────────────
+            BEGIN
+                SELECT aca.check_id
+                  INTO v_matched_check_id
+                  FROM xxemr_ap_checks_all aca
+                 WHERE aca.amount   = r_line.amount
+                   AND aca.segment7 = r_line.segment7
+                   AND NVL(aca.recon_flag, 'N') = 'N'
+				   AND UPPER(bank_name)     = 'DUBAI ISLAMIC BANK'
+                   AND ROWNUM = 1;
+
+                v_match_found := 'Y';
+
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    v_match_found := 'N';
+            END;
+
+            -- ──────────────────────────────────────────────────
+            -- Match confirmed → insert CROSS_ACCOUNT match group
+            -- ──────────────────────────────────────────────────
+            IF v_match_found = 'Y' THEN
+
+                v_candidates_token := 'AP' || TO_CHAR(v_matched_check_id);
+
+                xxemr_insert_match_group(
+                    p_statement_line_id => r_line.statement_line_id,
+                    p_candidates        => v_candidates_token,
+                    p_match_type        => 'CROSS_ACCOUNT',
+                    p_match_score       => 100,
+                    p_ranking           => 1,
+                    p_amt_diff          => 0,
+                    p_date_diff         => ABS(r_line.statement_date
+                                               - TRUNC(SYSDATE)),
+                    p_user              => 'SYSTEM'
+                );
+
+                v_total_matched := v_total_matched + 1;
+
+                log_msg := 'MATCHED'
+                        || ' | SRC_LINE='  || r_line.statement_line_id
+                        || ' | CHECK_ID='  || v_matched_check_id
+                        || ' | Amt='       || r_line.amount
+                        || ' | LA='        || NVL(r_line.segment7, 'N/A')
+                        || ' | Candidate=' || v_candidates_token;
+                xxemr_log(p_source, log_msg);
+
+            -- ──────────────────────────────────────────────────
+            -- No match → log and leave line open for manual review
+            -- ──────────────────────────────────────────────────
+            ELSE
+
+                v_total_skipped := v_total_skipped + 1;
+
+                log_msg := 'NO_MATCH'
+                        || ' | LINE_ID=' || r_line.statement_line_id
+                        || ' | Amount='  || r_line.amount
+                        || ' | LA='      || NVL(r_line.segment7, 'NULL');
+                xxemr_log(p_source, log_msg);
+
+            END IF;
+
+            COMMIT;
+
+        EXCEPTION
+            WHEN OTHERS THEN
+                v_error_message := SUBSTR(DBMS_UTILITY.FORMAT_ERROR_STACK, 1, 4000);
+                ROLLBACK TO sp_cross_pay_line;
+                v_error_count := v_error_count + 1;
+
+                log_msg := 'ERROR'
+                        || ' | LINE_ID=' || r_line.statement_line_id
+                        || ' | '         || SUBSTR(v_error_message, 1, 500);
+                xxemr_log(p_source, log_msg);
+
+        END;
+
+    END LOOP;
+
+    -- ── Summary ───────────────────────────────────────────────────
+    log_msg := 'END'
+            || ' | Processed=' || v_total_processed
+            || ' | Matched='   || v_total_matched
+            || ' | NoMatch='   || v_total_skipped
+            || ' | Errors='    || v_error_count;
+    xxemr_log(p_source, log_msg);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        xxemr_log(p_source, 'FATAL ERROR: ' || SUBSTR(SQLERRM, 1, 4000));
+        RAISE;
+
+END xxemr_dib_cross_acct_pay_match;
 
 END XXEMR_BANK_RECONCILIATION_PKG;
 /
