@@ -1,4 +1,4 @@
-CREATE OR REPLACE PACKAGE BODY XXEMR_CC_RECONCILIATION_PKG AS
+create or replace PACKAGE BODY XXEMR_CC_RECONCILIATION_PKG AS
  
  
  
@@ -207,7 +207,8 @@ BEGIN
         EXCEPTION
             WHEN NO_DATA_FOUND THEN l_statement_line_id := NULL;
         END;
- 
+     IF l_statement_line_id IS NOT NULL AND g.unmatched_cnt = 0 THEN
+
         INSERT INTO xxemr_cc_match_groups (
             cc_match_group_id,
             upload_id,
@@ -256,16 +257,22 @@ BEGIN
         )
         RETURNING cc_match_group_id INTO l_match_group_id;
  
-        log_cc('Bank=' || g.bank_account_id
-            || ' | Sum='        || g.matched_sum
-            || ' | Matched='    || g.matched_cnt
-            || ' | Unmatched='  || g.unmatched_cnt
-            || ' | StmtLine='   || NVL(TO_CHAR(l_statement_line_id),'NOT FOUND')
-            || ' | Status='     || CASE
-                                       WHEN l_statement_line_id IS NULL THEN 'STMT_NOT_FOUND'
-                                       WHEN g.unmatched_cnt > 0 THEN 'AMOUNT_MISMATCH'
-                                       ELSE 'AMOUNT_MATCH'
-                                   END);
+         log_cc('AMOUNT_MATCH: Bank=' || g.bank_account_id
+                || ' | Sum='     || g.matched_sum
+                || ' | Matched=' || g.matched_cnt
+                || ' | StmtLine=' || l_statement_line_id);
+ 
+        ELSE
+            log_cc('SKIPPED: Bank=' || g.bank_account_id
+                || ' | Sum='        || g.matched_sum
+                || ' | StmtLine='   || NVL(TO_CHAR(l_statement_line_id),'NOT FOUND')
+                || ' | Unmatched='  || g.unmatched_cnt
+                || CASE
+                       WHEN l_statement_line_id IS NULL
+                       THEN ' — no statement line found'
+                       ELSE ' — ' || g.unmatched_cnt || ' unmatched receipt(s)'
+                   END);
+        END IF;
     END LOOP;
  
     COMMIT;
@@ -828,3 +835,4 @@ END xxemr_process_cc_upload;
  
  
 END XXEMR_CC_RECONCILIATION_PKG;
+/
