@@ -26,6 +26,11 @@ PROCEDURE log_step (
     p_detail            IN VARCHAR2  DEFAULT NULL
 );
 
+PROCEDURE xxemr_confirm_cc_match (
+    p_statement_line_id IN NUMBER,
+    p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
+);
+
 PROCEDURE xxemr_fetch_candidate (
     p_source IN  VARCHAR2,
     p_id     IN  NUMBER,
@@ -777,7 +782,139 @@ EXCEPTION
         RAISE;
 END xxemr_confirm_ai_match;
 
+-- ================================================================
+-- PROCEDURE : xxemr_confirm_cc_match
+-- Purpose   : Called by xxemr_process_statement_action when the
+--             target line has cc_flag = 'Y' and the action is
+--             BEST POSSIBLE MATCH.
+--             Derives upload_id from cc_fund_transfer via the
+--             match group, calls xxemr_build_cc_fbdi for that
+--             upload, then stamps the line as reconciled.
+-- ================================================================
+PROCEDURE xxemr_confirm_cc_match (
+    p_statement_line_id IN NUMBER,
+    p_user              IN VARCHAR2 DEFAULT 'SYSTEM'
+)
+IS
+    l_match_group_id  NUMBER;
+    l_upload_id       NUMBER;
+BEGIN
+    -- Step 1: Find ACCEPTED (or highest scoring) CC_MATCH group
+    BEGIN
+        SELECT match_group_id
+          INTO l_match_group_id
+          FROM xxemr_match_groups
+         WHERE statement_line_id = p_statement_line_id
+           AND match_type        = 'CC_MATCH'
+           AND user_action       = 'ACCEPTED'
+           AND ROWNUM            = 1;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            -- No explicit selection — auto-pick highest score
+            BEGIN
+                SELECT match_group_id
+                  INTO l_match_group_id
+                  FROM (
+                        SELECT match_group_id
+                          FROM xxemr_match_groups
+                         WHERE statement_line_id = p_statement_line_id
+                           AND match_type        = 'CC_MATCH'
+                           AND NVL(user_action, 'PENDING')
+                                   NOT IN ('REJECTED','ACTION_TAKEN')
+                         ORDER BY match_score DESC, creation_date DESC
+                       )
+                 WHERE ROWNUM = 1;
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    RAISE_APPLICATION_ERROR(-20020,
+                        'xxemr_confirm_cc_match: No CC_MATCH group found for '
+                        || 'LINE_ID=' || p_statement_line_id);
+            END;
+    END;
 
+    -- Step 2: Derive upload_id via match group details → cc_fund_transfer
+    --         Path: match_group_id → match_group_details.candidate_id
+    --               (candidate_id = cash_receipt_id)
+    --               → xxemr_cc_fund_transfer.upload_id
+    BEGIN
+        SELECT ft.upload_id
+          INTO l_upload_id
+          FROM xxemr_match_group_details mgd
+          JOIN xxemr_cc_fund_transfer    ft
+            ON ft.cash_receipt_id = mgd.candidate_id
+         WHERE mgd.match_group_id   = l_match_group_id
+           AND mgd.candidate_source = 'AR'
+           AND ROWNUM               = 1;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20021,
+                'xxemr_confirm_cc_match: Cannot derive upload_id for '
+                || 'LINE_ID='        || p_statement_line_id
+                || ' MATCH_GROUP='   || l_match_group_id
+                || '. No matching row in xxemr_cc_fund_transfer.');
+    END;
+
+    log_step(NULL, p_statement_line_id,
+        'CC_CONFIRM_START', 'INFO',
+        'MatchGroup=' || l_match_group_id
+        || ' | UploadId=' || l_upload_id);
+
+    -- Step 3: Build FBDI staging rows for this upload
+    --         xxemr_build_cc_fbdi already filters by upload_id
+    --         and joins back to match_groups, so it will pick up
+    --         exactly the rows belonging to this statement line.
+XXEMR_CC_RECONCILIATION_PKG.xxemr_submit_cc_upload(
+    p_upload_id      => l_upload_id,
+    p_match_group_id => l_match_group_id,
+    p_created_by     => p_user
+);
+
+    -- Step 4: Stamp statement line — same as AI match path
+    UPDATE xxemr_bank_statement_lines
+       SET recon_status             = 'REC',
+           application_recon_status = 'RECONCILED',
+           ai_status                = 'CC_RECONCILED',
+           match_flag               = 'Y',
+           approval_status          = 'APPROVED',
+           approved_by              = p_user,
+           approved_date            = SYSTIMESTAMP,
+           last_update_date         = SYSTIMESTAMP,
+           last_updated_by          = p_user
+     WHERE statement_line_id = p_statement_line_id;
+
+    -- Step 5: Close out the match group
+    UPDATE xxemr_match_groups
+       SET user_action      = 'ACTION_TAKEN',
+           last_update_date = SYSTIMESTAMP,
+           last_updated_by  = p_user
+     WHERE match_group_id = l_match_group_id;
+
+    -- Step 6: Reject all other pending CC_MATCH groups for this line
+    UPDATE xxemr_match_groups
+       SET user_action      = 'REJECTED',
+           last_update_date = SYSTIMESTAMP,
+           last_updated_by  = p_user
+     WHERE statement_line_id = p_statement_line_id
+       AND match_type        = 'CC_MATCH'
+       AND match_group_id   <> l_match_group_id
+       AND NVL(user_action, 'PENDING') <> 'ACTION_TAKEN';
+
+    log_step(NULL, p_statement_line_id,
+        'CC_CONFIRM_DONE', 'SUCCESS',
+        'MatchGroup=' || l_match_group_id
+        || ' | UploadId=' || l_upload_id
+        || ' | User=' || p_user);
+
+    COMMIT;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        log_step(NULL, p_statement_line_id,
+            'CC_CONFIRM', 'FAILED',
+            SUBSTR(DBMS_UTILITY.FORMAT_ERROR_STACK, 1, 2000));
+        RAISE;
+END xxemr_confirm_cc_match;
 
 -- ================================================================
 -- SECTION 5 — EXTERNAL TRANSACTION PROCESSING
@@ -905,17 +1042,19 @@ IS
          ORDER BY statement_line_id;
 
     CURSOR c_lines_month_end IS
-        SELECT statement_line_id, description, reference_num, amount, statement_date
-          FROM XXEMR_BANK_STATEMENT_LINES
-         WHERE bank_account_id         = p_bank_account_id
-           AND full_keyword_check_done = 'N'
-         ORDER BY statement_line_id;
-
-    CURSOR c_kw_pw_only IS
+    SELECT statement_line_id, description, reference_num, amount, statement_date
+      FROM XXEMR_BANK_STATEMENT_LINES
+     WHERE bank_account_id         = p_bank_account_id
+       AND full_keyword_check_done = 'N'
+     ORDER BY statement_line_id;
+    
+	CURSOR c_kw_pw_only IS
         SELECT keywords              AS keyword_value,
                transaction_code_type AS ext_txn_type,
                is_profit_withdrawal,
-               keyword_priority
+               keyword_priority,
+               NVL(is_credit_card,   'N') AS is_credit_card,
+               NVL(is_fund_transfer, 'N') AS is_fund_transfer
           FROM XXEMR_KEYWORD_MAPPING
          WHERE enabled_flag         = 'Y'
            AND is_profit_withdrawal = 'Y'
@@ -928,122 +1067,241 @@ IS
         SELECT keywords              AS keyword_value,
                transaction_code_type AS ext_txn_type,
                is_profit_withdrawal,
-               keyword_priority
+               keyword_priority,
+               NVL(is_credit_card,   'N') AS is_credit_card,
+               NVL(is_fund_transfer, 'N') AS is_fund_transfer
           FROM XXEMR_KEYWORD_MAPPING
          WHERE enabled_flag = 'Y'
            AND (   bank IS NULL
                 OR INSTR(UPPER(p_bank_name), UPPER(bank)) > 0
                 OR INSTR(UPPER(bank), UPPER(p_bank_name)) > 0)
          ORDER BY keyword_priority NULLS LAST, keywords;
+		 
+		 CURSOR c_kw_cc_ft IS
+    SELECT keywords              AS keyword_value,
+           transaction_code_type AS ext_txn_type,
+           is_profit_withdrawal,
+           keyword_priority,
+           NVL(is_credit_card,   'N') AS is_credit_card,
+           NVL(is_fund_transfer, 'N') AS is_fund_transfer
+      FROM XXEMR_KEYWORD_MAPPING
+     WHERE enabled_flag = 'Y'
+       AND (is_credit_card = 'Y' OR is_fund_transfer = 'Y')
+       AND (   bank IS NULL
+            OR INSTR(UPPER(p_bank_name), UPPER(bank)) > 0
+            OR INSTR(UPPER(bank), UPPER(p_bank_name)) > 0)
+     ORDER BY keyword_priority NULLS LAST, keywords;
 
     v_ext_flag             VARCHAR2(1)   := 'N';
     v_matched_keyword      VARCHAR2(100) := NULL;
     v_is_profit_withdrawal VARCHAR2(1)   := 'N';
+    v_cc_flag              VARCHAR2(1)   := 'N';
+    v_ft_flag              VARCHAR2(1)   := 'N';
+    v_cc_matched_keyword   VARCHAR2(100) := NULL;
+    v_ft_matched_keyword   VARCHAR2(100) := NULL;
+    v_cc_best_priority     NUMBER        := 999999;
+    v_ft_best_priority     NUMBER        := 999999;
 
-    PROCEDURE process_one_line (
-        p_statement_line_id IN NUMBER,
-        p_description       IN VARCHAR2
-    )
-    IS
-        v_error_message VARCHAR2(4000);
+  PROCEDURE process_one_line (
+    p_statement_line_id IN NUMBER,
+    p_description       IN VARCHAR2
+)
+IS
+    v_error_message VARCHAR2(4000);
+BEGIN
+    v_ext_flag             := 'N';
+    v_matched_keyword      := NULL;
+    v_is_profit_withdrawal := 'N';
+    v_cc_flag              := 'N';
+    v_ft_flag              := 'N';
+    v_cc_matched_keyword   := NULL;
+    v_ft_matched_keyword   := NULL;
+    v_cc_best_priority     := 999999;
+    v_ft_best_priority     := 999999;
+
+    SAVEPOINT sp_kw_line;
+
     BEGIN
-        v_ext_flag             := 'N';
-        v_matched_keyword      := NULL;
-        v_is_profit_withdrawal := 'N';
+        IF p_mode = 'DAILY' THEN
+            DECLARE
+                v_best_priority NUMBER := 999999;
+                v_best_length   NUMBER := 0;
+            BEGIN
+-- 1. Profit Withdrawal + External txn logic
+FOR kw IN c_kw_pw_only LOOP
+    IF INSTR(UPPER(p_description), UPPER(kw.keyword_value)) > 0 THEN
 
-        SAVEPOINT sp_kw_line;
+        IF    NVL(kw.keyword_priority, 999999) < v_best_priority
+           OR (NVL(kw.keyword_priority, 999999) = v_best_priority
+               AND LENGTH(kw.keyword_value) > v_best_length)
+        THEN
+            v_best_priority        := NVL(kw.keyword_priority, 999999);
+            v_best_length          := LENGTH(kw.keyword_value);
+            v_ext_flag             := 'Y';
+            v_matched_keyword      := kw.keyword_value;
+            v_is_profit_withdrawal := kw.is_profit_withdrawal;
+        END IF;
 
-        BEGIN
+    END IF;
+END LOOP;
+
+
+-- 2. CC / FT detection (ONLY here)
+FOR kw IN c_kw_cc_ft LOOP
+    IF INSTR(UPPER(p_description), UPPER(kw.keyword_value)) > 0 THEN
+
+        -- CC detection
+        IF kw.is_credit_card = 'Y'
+           AND NVL(kw.keyword_priority, 999999) <= v_cc_best_priority
+        THEN
+            v_cc_best_priority   := NVL(kw.keyword_priority, 999999);
+            v_cc_flag            := 'Y';
+            v_cc_matched_keyword := kw.keyword_value;
+        END IF;
+
+        -- FT detection (only if no CC)
+        IF kw.is_fund_transfer = 'Y'
+           AND v_cc_flag = 'N'
+           AND NVL(kw.keyword_priority, 999999) <= v_ft_best_priority
+        THEN
+            v_ft_best_priority   := NVL(kw.keyword_priority, 999999);
+            v_ft_flag            := 'Y';
+            v_ft_matched_keyword := kw.keyword_value;
+        END IF;
+
+    END IF;
+END LOOP;
+
+            UPDATE XXEMR_BANK_STATEMENT_LINES
+               SET external_flag         = CASE
+                                               WHEN v_cc_flag = 'Y' THEN 'N'
+                                               WHEN v_ft_flag = 'Y' THEN 'N'
+                                               ELSE v_ext_flag
+                                           END,
+                   matched_keyword       = CASE
+                                               WHEN v_cc_flag = 'Y' THEN v_cc_matched_keyword
+                                               WHEN v_ft_flag = 'Y' THEN v_ft_matched_keyword
+                                               ELSE v_matched_keyword
+                                           END,
+                   is_profit_withdrawal  = CASE
+                                               WHEN v_cc_flag = 'Y' THEN 'N'
+                                               WHEN v_ft_flag = 'Y' THEN 'N'
+                                               ELSE v_is_profit_withdrawal
+                                           END,
+                   pw_keyword_check_done = 'Y',
+                   cc_flag               = v_cc_flag,
+                   fund_transfer_flag    = v_ft_flag,
+                           cc_check_done = 'Y',
+                   last_updated          = SYSTIMESTAMP
+             WHERE statement_line_id     = p_statement_line_id;
+END;
+        ELSE
+            DECLARE
+                v_best_priority NUMBER := 999999;
+                v_best_length   NUMBER := 0;
+            BEGIN
+                FOR kw IN c_kw_all LOOP
+                    IF INSTR(UPPER(p_description), UPPER(kw.keyword_value)) > 0 THEN
+
+                        -- Ext txn best-match (unchanged)
+                        IF    NVL(kw.keyword_priority, 999999) < v_best_priority
+                           OR (    NVL(kw.keyword_priority, 999999) = v_best_priority
+                               AND LENGTH(kw.keyword_value) > v_best_length)
+                        THEN
+                            v_best_priority        := NVL(kw.keyword_priority, 999999);
+                            v_best_length          := LENGTH(kw.keyword_value);
+                            v_ext_flag             := 'Y';
+                            v_matched_keyword      := kw.keyword_value;
+                            v_is_profit_withdrawal := kw.is_profit_withdrawal;
+                        END IF;
+
+                        -- CC flag — sibling IF
+                        IF kw.is_credit_card = 'Y'
+                           AND NVL(kw.keyword_priority, 999999) <= v_cc_best_priority
+                        THEN
+                            v_cc_best_priority   := NVL(kw.keyword_priority, 999999);
+                            v_cc_flag            := 'Y';
+                            v_cc_matched_keyword := kw.keyword_value;
+                        END IF;
+
+                        -- FT flag — sibling IF
+                        IF kw.is_fund_transfer = 'Y'
+                           AND v_cc_flag = 'N'
+                           AND NVL(kw.keyword_priority, 999999) <= v_ft_best_priority
+                        THEN
+                            v_ft_best_priority   := NVL(kw.keyword_priority, 999999);
+                            v_ft_flag            := 'Y';
+                            v_ft_matched_keyword := kw.keyword_value;
+                        END IF;
+
+                    END IF;
+                END LOOP;
+            END;
+
+            UPDATE XXEMR_BANK_STATEMENT_LINES
+               SET external_flag           = CASE
+                                                 WHEN v_cc_flag = 'Y' THEN 'N'
+                                                 WHEN v_ft_flag = 'Y' THEN 'N'
+                                                 WHEN external_flag = 'Y' THEN 'Y'
+                                                 ELSE v_ext_flag
+                                             END,
+                   matched_keyword         = CASE
+                                                 WHEN v_cc_flag = 'Y' THEN v_cc_matched_keyword
+                                                 WHEN v_ft_flag = 'Y' THEN v_ft_matched_keyword
+                                                 WHEN external_flag = 'Y' AND matched_keyword IS NOT NULL
+                                                      THEN matched_keyword
+                                                 ELSE v_matched_keyword
+                                             END,
+                   is_profit_withdrawal    = CASE
+                                                 WHEN v_cc_flag = 'Y' THEN 'N'
+                                                 WHEN v_ft_flag = 'Y' THEN 'N'
+                                                 WHEN external_flag = 'Y' AND is_profit_withdrawal = 'Y'
+                                                      THEN 'Y'
+													  
+                                                 ELSE v_is_profit_withdrawal
+                                             END,
+                   full_keyword_check_done = 'Y',
+                   cc_flag                 = v_cc_flag,
+                   fund_transfer_flag      = v_ft_flag,
+                             cc_check_done = 'Y',
+                   last_updated            = SYSTIMESTAMP
+             WHERE statement_line_id       = p_statement_line_id;
+        END IF;
+
+        COMMIT;
+
+        log_step(p_run_id, p_statement_line_id,
+            'KEYWORD_CHECK_' || p_mode,
+            CASE
+                WHEN v_cc_flag  = 'Y' THEN 'CC_IDENTIFIED'
+                WHEN v_ft_flag  = 'Y' THEN 'FT_IDENTIFIED'
+                WHEN v_ext_flag = 'Y' THEN 'EXT_TXN_IDENTIFIED'
+                ELSE 'NOT_EXT_TXN'
+            END,
+            'Mode: ' || p_mode
+            || ' | Keyword: ' || NVL(v_matched_keyword, 'NONE')
+            || ' | PW: '      || v_is_profit_withdrawal
+            || ' | CC: '      || v_cc_flag
+            || ' | FT: '      || v_ft_flag);
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_error_message := SUBSTR(DBMS_UTILITY.FORMAT_ERROR_STACK, 1, 4000);
+            ROLLBACK TO sp_kw_line;
             IF p_mode = 'DAILY' THEN
-                DECLARE
-                    v_best_priority NUMBER := 999999;
-                    v_best_length   NUMBER := 0;
-                BEGIN
-                    FOR kw IN c_kw_pw_only LOOP
-                        IF INSTR(UPPER(p_description), UPPER(kw.keyword_value)) > 0 THEN
-                            IF    NVL(kw.keyword_priority, 999999) < v_best_priority
-                               OR (    NVL(kw.keyword_priority, 999999) = v_best_priority
-                                   AND LENGTH(kw.keyword_value) > v_best_length)
-                            THEN
-                                v_best_priority        := NVL(kw.keyword_priority, 999999);
-                                v_best_length          := LENGTH(kw.keyword_value);
-                                v_ext_flag             := 'Y';
-                                v_matched_keyword      := kw.keyword_value;
-                                v_is_profit_withdrawal := kw.is_profit_withdrawal;
-                            END IF;
-                        END IF;
-                    END LOOP;
-                END;
-
                 UPDATE XXEMR_BANK_STATEMENT_LINES
-                   SET external_flag         = v_ext_flag,
-                       matched_keyword       = v_matched_keyword,
-                       is_profit_withdrawal  = v_is_profit_withdrawal,
-                       pw_keyword_check_done = 'Y',
-                       last_updated          = SYSTIMESTAMP
-                 WHERE statement_line_id     = p_statement_line_id;
-
+                   SET pw_keyword_check_done = 'E', last_updated = SYSTIMESTAMP
+                 WHERE statement_line_id = p_statement_line_id;
             ELSE
-                DECLARE
-                    v_best_priority NUMBER := 999999;
-                    v_best_length   NUMBER := 0;
-                BEGIN
-                    FOR kw IN c_kw_all LOOP
-                        IF INSTR(UPPER(p_description), UPPER(kw.keyword_value)) > 0 THEN
-                            IF    NVL(kw.keyword_priority, 999999) < v_best_priority
-                               OR (    NVL(kw.keyword_priority, 999999) = v_best_priority
-                                   AND LENGTH(kw.keyword_value) > v_best_length)
-                            THEN
-                                v_best_priority        := NVL(kw.keyword_priority, 999999);
-                                v_best_length          := LENGTH(kw.keyword_value);
-                                v_ext_flag             := 'Y';
-                                v_matched_keyword      := kw.keyword_value;
-                                v_is_profit_withdrawal := kw.is_profit_withdrawal;
-                            END IF;
-                        END IF;
-                    END LOOP;
-                END;
-
                 UPDATE XXEMR_BANK_STATEMENT_LINES
-                   SET external_flag           =
-                           CASE WHEN external_flag = 'Y' THEN 'Y' ELSE v_ext_flag END,
-                       matched_keyword         =
-                           CASE WHEN external_flag = 'Y' AND matched_keyword IS NOT NULL
-                                THEN matched_keyword ELSE v_matched_keyword END,
-                       is_profit_withdrawal    =
-                           CASE WHEN external_flag = 'Y' AND is_profit_withdrawal = 'Y'
-                                THEN 'Y' ELSE v_is_profit_withdrawal END,
-                       full_keyword_check_done = 'Y',
-                       last_updated            = SYSTIMESTAMP
-                 WHERE statement_line_id       = p_statement_line_id;
+                   SET full_keyword_check_done = 'E', last_updated = SYSTIMESTAMP
+                 WHERE statement_line_id = p_statement_line_id;
             END IF;
-
             COMMIT;
-
             log_step(p_run_id, p_statement_line_id,
-                'KEYWORD_CHECK_' || p_mode,
-                CASE v_ext_flag WHEN 'Y' THEN 'EXT_TXN_IDENTIFIED' ELSE 'NOT_EXT_TXN' END,
-                'Mode: ' || p_mode || ' | Keyword: ' || NVL(v_matched_keyword,'NONE')
-                || ' | PW: ' || v_is_profit_withdrawal);
-
-        EXCEPTION
-            WHEN OTHERS THEN
-                v_error_message := SUBSTR(DBMS_UTILITY.FORMAT_ERROR_STACK, 1, 4000);
-                ROLLBACK TO sp_kw_line;
-                IF p_mode = 'DAILY' THEN
-                    UPDATE XXEMR_BANK_STATEMENT_LINES
-                       SET pw_keyword_check_done = 'E', last_updated = SYSTIMESTAMP
-                     WHERE statement_line_id = p_statement_line_id;
-                ELSE
-                    UPDATE XXEMR_BANK_STATEMENT_LINES
-                       SET full_keyword_check_done = 'E', last_updated = SYSTIMESTAMP
-                     WHERE statement_line_id = p_statement_line_id;
-                END IF;
-                COMMIT;
-                log_step(p_run_id, p_statement_line_id,
-                    'KEYWORD_CHECK_' || p_mode, 'FAILED', v_error_message);
-        END;
-    END process_one_line;
+                'KEYWORD_CHECK_' || p_mode, 'FAILED', v_error_message);
+    END;
+END process_one_line;
 
 BEGIN
     IF p_mode = 'DAILY' THEN
@@ -2630,7 +2888,7 @@ BEGIN
                AND NVL(r.match_flag,  'N') <> 'Y'
                AND NVL(r.recon_flag,  'N') <> 'Y'
                AND r.status NOT IN ('REV')
-               AND ABS(l_stmt_amount - r.amount) <= p_amount_tolerance
+               AND r.amount <= l_stmt_amount + p_amount_tolerance
         ),
         ar_candidates AS (
             SELECT
@@ -2744,9 +3002,11 @@ PROCEDURE xxemr_run_one_to_one_batch (
           FROM  xxemr_bank_statement_lines   l
           JOIN  xxemr_bank_statement_headers h
             ON  h.statement_header_id = l.statement_header_id
-         WHERE  h.bank_account_id         = p_bank_account_id
+ WHERE  h.bank_account_id         = p_bank_account_id
            AND  NVL(l.match_flag,  'N')   = 'N'
-           AND  NVL(l.recon_status,'UNR') = 'UNR';
+           AND  NVL(l.recon_status,'UNR') = 'UNR'
+           AND  NVL(l.cc_flag,          'N') = 'N'
+           AND  NVL(l.fund_transfer_flag,'N') = 'N';
 
     l_result            SYS_REFCURSOR;
     l_candidate_rank    NUMBER;
@@ -3212,6 +3472,8 @@ PROCEDURE xxemr_run_batch (
                    BETWEEN TRUNC(p_stmt_from_date) AND TRUNC(p_stmt_to_date)
            AND NVL(s.match_flag,   'N') <> 'Y'
            AND NVL(s.recon_status, 'UNR') NOT IN ('REC')
+           AND NVL(s.cc_flag,           'N') = 'N'
+           AND NVL(s.fund_transfer_flag,'N') = 'N'
            AND NOT EXISTS (
                    SELECT 1 FROM xxemr_match_groups mg
                     WHERE mg.statement_line_id = s.statement_line_id
@@ -3445,6 +3707,8 @@ PROCEDURE xxemr_run_auto (
            AND NVL(s.recon_status, 'UNR') NOT IN ('REC')
            AND s.bank_account_id IS NOT NULL
            AND s.statement_date >= ADD_MONTHS(TRUNC(SYSDATE), -3)
+           AND NVL(s.cc_flag,           'N') = 'N'
+           AND NVL(s.fund_transfer_flag,'N') = 'N'
            AND NOT EXISTS (
                    SELECT 1 FROM xxemr_match_groups mg
                     WHERE mg.statement_line_id = s.statement_line_id
@@ -3672,6 +3936,43 @@ BEGIN
 
     -- Step 3: Route based on action
     IF l_action = 'BEST POSSIBLE MATCH' THEN
+	
+	 -- ── CC Detection ──────────────────────────────────────────
+    -- If the statement line carries cc_flag = 'Y', route to the
+    -- CC reconciliation path instead of the standard AI path.
+    -- The CC path writes to xxemr_cc_fbdi_lines; OIC polls there.
+    -- ──────────────────────────────────────────────────────────
+    DECLARE
+        l_cc_flag VARCHAR2(1);
+    BEGIN
+        SELECT NVL(cc_flag, 'N')
+          INTO l_cc_flag
+          FROM xxemr_bank_statement_lines
+         WHERE statement_line_id = p_statement_line_id;
+
+        IF l_cc_flag = 'Y' THEN
+
+            xxemr_log(
+                p_source      => 'STATEMENT_ACTION',
+                p_log_message => 'CC line detected. Routing to xxemr_confirm_cc_match. '
+                              || 'LINE_ID=' || p_statement_line_id
+            );
+
+            xxemr_confirm_cc_match(
+                p_statement_line_id => p_statement_line_id,
+                p_user              => p_user
+            );
+
+            xxemr_log(
+                p_source      => 'STATEMENT_ACTION',
+                p_log_message => 'CC RECONCILIATION completed. FBDI staged for OIC. '
+                              || 'LINE_ID=' || p_statement_line_id
+            );
+
+            RETURN;  -- exit procedure — CC path is complete
+
+        END IF;
+    END;
 
         -- Find the ACCEPTED group (set by Apply Selection in the popup).
         -- If the user skipped Apply Selection and clicked BPM directly,
@@ -4061,6 +4362,7 @@ BEGIN
                   FROM xxemr_ap_checks_all aca
                  WHERE aca.amount   = r_line.amount
                    AND aca.segment7 = r_line.segment7
+				   AND bank_account_id <> r_line.bank_account_id
                    AND NVL(aca.recon_flag, 'N') = 'N'
 				   AND UPPER(bank_name)     = 'DUBAI ISLAMIC BANK'
                    AND ROWNUM = 1;
