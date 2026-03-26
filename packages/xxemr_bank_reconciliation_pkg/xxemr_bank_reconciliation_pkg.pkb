@@ -72,8 +72,6 @@ EXCEPTION
     WHEN OTHERS THEN
         NULL; -- Logging must never break the main process
 END xxemr_log;
-
-
 -- ----------------------------------------------------------------
 -- PRIVATE: LOG_STEP
 -- Purpose : Autonomous transaction logger. Writes to
@@ -959,7 +957,7 @@ BEGIN
         || '"CurrencyCode":"'    || NVL(p_currency_code,'AED')                                        || '",'
         || '"Description":"'     || REPLACE(SUBSTR(NVL(p_description, ''),1,240), '"','\"')           || '",'
         || '"ReferenceText":"'   || REPLACE(SUBSTR(NVL(p_reference_num,''),1,100), '"','\"')          || '",'
-        || '"TransactionType":"' || REPLACE(NVL(p_txn_type,''), '"','\"')                             || '",'
+        || '"TransactionType":"' || REPLACE(NVL(p_txn_type,''), '"','\"') || '",'
         || '"AccountingFlag":'   || 'false'                                                           || ','
         || '"TransactionDate":"' || TO_CHAR(p_transaction_date,'YYYY-MM-DD')                          || '"'
         || CASE WHEN p_asset_account_combo IS NOT NULL
@@ -2097,38 +2095,7 @@ BEGIN
            last_updated   = SYSTIMESTAMP
      WHERE statement_line_id = p_statement_line_id;
     COMMIT;
-
-    DECLARE
-        v_escrow_flag VARCHAR2(10);
-    BEGIN
-        SELECT NVL(h.escrow_account,'N')
-          INTO v_escrow_flag
-          FROM XXEMR_BANK_STATEMENT_HEADERS h
-         WHERE h.statement_header_id = v_stmt.statement_header_id;
-
-        IF v_escrow_flag = 'Y' THEN
-            v_txn_type := v_stmt.trx_type;
-        ELSE
-            SELECT CASE
-                       WHEN INSTR(k.transaction_code_type,'/') > 0
-                       THEN SUBSTR(k.transaction_code_type,1,INSTR(k.transaction_code_type,'/')-1)
-                       ELSE k.transaction_code_type
-                   END
-              INTO v_txn_type
-              FROM XXEMR_KEYWORD_MAPPING k
-             WHERE k.enabled_flag = 'Y'
-               AND NVL(k.escrow,'N') = 'N'
-               AND UPPER(TRIM(k.keywords)) = UPPER(TRIM(v_stmt.matched_keyword))
-               AND (   k.bank IS NULL
-                    OR INSTR(UPPER(TRIM(v_bank_name)),UPPER(TRIM(k.bank))) > 0
-                    OR INSTR(UPPER(TRIM(k.bank)),UPPER(TRIM(v_bank_name))) > 0)
-             ORDER BY k.keyword_priority NULLS LAST
-             FETCH FIRST 1 ROW ONLY;
-        END IF;
-    EXCEPTION
-        WHEN NO_DATA_FOUND THEN v_txn_type := v_stmt.trx_type;
-    END;
-
+    v_txn_type := v_stmt.trx_type;
     v_creation_amount :=
         CASE UPPER(v_stmt.flow_indicator)
             WHEN 'DBIT' THEN -1 * ABS(v_stmt.amount)
@@ -2285,37 +2252,7 @@ BEGIN
      WHERE statement_line_id = p_statement_line_id;
     COMMIT;
 
-    DECLARE
-        v_escrow_flag VARCHAR2(10);
-    BEGIN
-        SELECT NVL(h.escrow_account,'N')
-          INTO v_escrow_flag
-          FROM XXEMR_BANK_STATEMENT_HEADERS h
-         WHERE h.statement_header_id = v_stmt.statement_header_id;
-
-        IF v_escrow_flag = 'Y' THEN
-            v_txn_type := v_stmt.trx_type;
-        ELSE
-            SELECT CASE
-                       WHEN INSTR(k.transaction_code_type,'/') > 0
-                       THEN SUBSTR(k.transaction_code_type,1,INSTR(k.transaction_code_type,'/')-1)
-                       ELSE k.transaction_code_type
-                   END
-              INTO v_txn_type
-              FROM XXEMR_KEYWORD_MAPPING k
-             WHERE k.enabled_flag = 'Y'
-               AND NVL(k.escrow,'N') = 'N'
-               AND UPPER(TRIM(k.keywords)) = UPPER(TRIM(v_stmt.matched_keyword))
-               AND (   k.bank IS NULL
-                    OR INSTR(UPPER(TRIM(v_bank_name)),UPPER(TRIM(k.bank))) > 0
-                    OR INSTR(UPPER(TRIM(k.bank)),UPPER(TRIM(v_bank_name))) > 0)
-             ORDER BY k.keyword_priority NULLS LAST
-             FETCH FIRST 1 ROW ONLY;
-        END IF;
-    EXCEPTION
-        WHEN NO_DATA_FOUND THEN v_txn_type := v_stmt.trx_type;
-    END;
-
+    v_txn_type := v_stmt.trx_type;
     v_creation_amount :=
         CASE UPPER(v_stmt.flow_indicator)
             WHEN 'DBIT' THEN -1 * ABS(v_stmt.amount)
@@ -2369,13 +2306,13 @@ BEGIN
          WHERE match_group_id IN (
                    SELECT match_group_id FROM xxemr_match_groups
                     WHERE statement_line_id = p_statement_line_id
-                      AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
+                      AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY','NO_MATCH_FOUND')
                       AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN'
                );
 
         DELETE FROM xxemr_match_groups
          WHERE statement_line_id = p_statement_line_id
-           AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
+           AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY','NO_MATCH_FOUND')
            AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN';
 
         UPDATE xxemr_match_groups
@@ -2385,21 +2322,6 @@ BEGIN
                last_updated_by  = NVL(V('APP_USER'), 'SYSTEM')
          WHERE statement_line_id = p_statement_line_id
            AND match_type        IN ('EXT_PENDING', 'EXT_PARTIAL');
-
-        -- Clean up any ONE_TO_ONE / ONE_TO_MANY AI suggestions that
-        -- are now superseded by the external transaction creation.
-        DELETE FROM xxemr_match_group_details
-         WHERE match_group_id IN (
-                   SELECT match_group_id FROM xxemr_match_groups
-                    WHERE statement_line_id = p_statement_line_id
-                      AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
-                      AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN'
-               );
-
-        DELETE FROM xxemr_match_groups
-         WHERE statement_line_id = p_statement_line_id
-           AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY')
-           AND NVL(user_action,'PENDING') <> 'ACTION_TAKEN';
 
         COMMIT;
         log_step(NULL, p_statement_line_id, 'ME_CREATE', 'SUCCESS',
@@ -2621,10 +2543,6 @@ PROCEDURE xxemr_call_void_api (
 		p_source		 VARCHAR2(200):='xxemr_call_void_api';
 		LOG_MSG          VARCHAR2(2000);
     BEGIN
-        -- Read credentials / base URL from config (same keys used by CREATE proc)
-        /*SELECT config_value INTO v_base_endpoint
-          FROM apex_recon_config
-         WHERE config_key = 'FUSION_CE_EXT_TXN_ENDPOINT';*/
 		 v_base_endpoint:='https://emhm-dev18.fa.ocs.oraclecloud.com/fscmRestApi/resources/11.13.18.05/cashExternalTransactions/';
 
         SELECT config_value INTO v_username
@@ -3046,6 +2964,7 @@ BEGIN
                               ON h.statement_header_id = l.statement_header_id
                            WHERE h.bank_account_id = p_bank_account_id
                       )
+                  AND g.match_type IN ('ONE_TO_ONE','ONE_TO_MANY','NO_MATCH_FOUND')
                   AND NVL(g.user_action, 'PENDING') <> 'ACTION_TAKEN'
            );
 
@@ -3057,6 +2976,7 @@ BEGIN
                    ON h.statement_header_id = l.statement_header_id
                 WHERE h.bank_account_id = p_bank_account_id
            )
+       AND g.match_type IN ('ONE_TO_ONE','ONE_TO_MANY','NO_MATCH_FOUND')
        AND NVL(g.user_action, 'PENDING') <> 'ACTION_TAKEN';
 
     DBMS_OUTPUT.PUT_LINE('Purged PENDING suggestions. ACTION_TAKEN preserved.');
@@ -3517,6 +3437,7 @@ BEGIN
                                      BETWEEN TRUNC(p_stmt_from_date)
                                          AND TRUNC(p_stmt_to_date)
                       )
+                  AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY','NO_MATCH_FOUND')
                   AND NVL(user_action, 'PENDING')
                           NOT IN ('ACTION_TAKEN', 'MANUAL_RECON')
            );
@@ -3529,6 +3450,7 @@ BEGIN
                   AND TRUNC(s.statement_date)
                           BETWEEN TRUNC(p_stmt_from_date) AND TRUNC(p_stmt_to_date)
            )
+       AND match_type IN ('ONE_TO_ONE','ONE_TO_MANY','NO_MATCH_FOUND')
        AND NVL(user_action, 'PENDING') NOT IN ('ACTION_TAKEN', 'MANUAL_RECON');
 
     FOR r IN c_stmt LOOP
